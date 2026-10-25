@@ -1,163 +1,124 @@
-
 require("dotenv").config({
   path: require("node:path").resolve(__dirname, "../../.env"),
 });
 
 const mongoose = require("mongoose");
-if (process.env.MONGODB_DNS_SERVER) {
-  require("node:dns").setServers([process.env.MONGODB_DNS_SERVER]);
+const {
+  ENVIRONMENTS,
+  buildEnvironmentConfigs,
+  deepEqual,
+  validateLegacyDocument,
+  validateMigratedDocument,
+} = require("./migrationHelpers");
+
+function parseArguments(args) {
+  const supported = new Set(["--dry-run", "--apply"]);
+  const unknown = args.filter((arg) => !supported.has(arg));
+  if (unknown.length || (args.includes("--dry-run") && args.includes("--apply"))) {
+    throw new Error("Usage: node src/scripts/migrateFeatureFlags.js [--dry-run|--apply]");
+  }
+  return { apply: args.includes("--apply"), dryRun: args.includes("--dry-run") };
 }
 
-const environments = ["development", "staging", "production"];
-const dryRun = process.argv.includes("--dry-run");
+async function migrateFeatureFlags({ db, apply = false, logger = console } = {}) {
+  if (!db) throw new Error("A database connection is required");
+  const collections = await db.listCollections({ name: "featureflags" }).toArray();
+  if (!collections.length) throw new Error("The featureflags collection does not exist");
 
-async function migrateFeatureFlags() {
-  if (!process.env.MONGODB_URI) {
-    throw new Error("MONGODB_URI is missing from server/.env");
+  const collection = db.collection("featureflags");
+  const flags = await collection.find({}).toArray();
+  const pending = [];
+  const validationErrors = [];
+
+  for (const flag of flags) {
+    if (Object.prototype.hasOwnProperty.call(flag, "environments")) {
+      const error = validateMigratedDocument(flag);
+      if (error) validationErrors.push(`${flag._id}: ${error}`);
+    } else {
+      const error = validateLegacyDocument(flag);
+      if (error) validationErrors.push(`${flag._id}: ${error}`);
+      else pending.push(flag);
+    }
   }
 
-  await mongoose.connect(process.env.MONGODB_URI, {
-    serverSelectionTimeoutMS: 10000,
-  });
+  logger.log(`Found ${flags.length} feature flag(s).`);
+  logger.log(`Would migrate: ${pending.length}`);
+  logger.log(`Already migrated: ${flags.length - pending.length - validationErrors.length}`);
+  logger.log(`Requires attention: ${validationErrors.length}`);
+  validationErrors.forEach((error) => logger.log(`ATTENTION: ${error}`));
+  if (!apply) return { pending, validationErrors, migratedCount: 0 };
+  if (validationErrors.length) {
+    throw new Error(`Migration aborted before writes:\n${validationErrors.join("\n")}`);
+  }
+  if (!pending.length) return { pending, validationErrors, migratedCount: 0 };
 
-  try {
-    const collection = mongoose.connection.collection("featureflags");
-    const flags = await collection.find({}).toArray();
+  const backupName = `featureflags_backup_${new Date().toISOString().replace(/[-:.TZ]/g, "")}`;
+  if (await db.listCollections({ name: backupName }).hasNext()) {
+    throw new Error(`Backup collection already exists: ${backupName}`);
+  }
+  const backup = db.collection(backupName);
+  await backup.insertMany(pending);
+  const copies = await backup.find({}).toArray();
+  if (
+    copies.length !== pending.length ||
+    !pending.every((flag) => copies.some((copy) => deepEqual(flag, copy)))
+  ) {
+    throw new Error(`Backup verification failed for ${backupName}`);
+  }
+  logger.log(`Backup verified: ${backupName}`);
 
-    console.log(`Found ${flags.length} feature flag(s).`);
-    console.log(
-      `Mode: ${dryRun ? "DRY RUN - no writes" : "LIVE MIGRATION"}`
+  let migratedCount = 0;
+  for (const flag of pending) {
+    const result = await collection.updateOne(
+      {
+        _id: flag._id,
+        name: flag.name,
+        key: flag.key,
+        environment: flag.environment,
+        enabled: flag.enabled,
+        environments: { $exists: false },
+      },
+      {
+        $set: { environments: buildEnvironmentConfigs(flag) },
+        $unset: { enabled: "", environment: "" },
+      }
     );
-
-    const validationErrors = [];
-    for (const flag of flags) {
-      if (flag.environments) {
-        continue;
-      }
-
-      if (!environments.includes(flag.environment)) {
-        validationErrors.push(
-          `${flag._id}: unsupported environment "${flag.environment}"`
-        );
-      }
-
-      if (typeof flag.enabled !== "boolean") {
-        validationErrors.push(`${flag._id}: enabled must be a boolean`);
-      }
+    if (result.matchedCount !== 1 || result.modifiedCount !== 1) {
+      throw new Error(`Migration conflict for "${flag.key}" after ${migratedCount} successful update(s)`);
     }
+    migratedCount += 1;
+  }
+  logger.log(`Migration completed: ${migratedCount} document(s).`);
+  return { pending, validationErrors, migratedCount, backupName };
+}
 
-    const pendingFlags = flags.filter((flag) => !flag.environments);
-    const alreadyMigrated = flags.length - pendingFlags.length;
-
-    if (dryRun) {
-      for (const flag of pendingFlags) {
-        console.log(
-          `WOULD MIGRATE: ${flag.key} (${flag.environment}, enabled=${flag.enabled})`
-        );
-      }
-
-      console.log(`Would migrate: ${pendingFlags.length}`);
-      console.log(`Already migrated: ${alreadyMigrated}`);
-      console.log(`Requires attention: ${validationErrors.length}`);
-      validationErrors.forEach((error) => console.log(`ATTENTION: ${error}`));
-      return;
-    }
-
-    if (validationErrors.length) {
-      throw new Error(
-        `Migration aborted before writes:\n${validationErrors.join("\n")}`
-      );
-    }
-
-    if (pendingFlags.length === 0) {
-      console.log("No legacy flags require migration.");
-      return;
-    }
-
-    // Create a unique backup collection for this migration attempt.
-    const backupCollectionName =
-      `featureflags_backup_${new Date()
-        .toISOString()
-        .replace(/[-:.TZ]/g, "")}`;
-
-    const existingBackup = await mongoose.connection
-      .listCollections({ name: backupCollectionName })
-      .hasNext();
-    if (existingBackup) {
-      throw new Error(`Backup collection already exists: ${backupCollectionName}`);
-    }
-    const backupCollection = mongoose.connection.collection(backupCollectionName);
-
-    await backupCollection.insertMany(pendingFlags);
-
-    const backupCount = await backupCollection.countDocuments();
-    const backupIds = await backupCollection
-      .find({}, { projection: { _id: 1, key: 1, enabled: 1, environment: 1 } })
-      .toArray();
-    const backupMatches = backupIds.length === pendingFlags.length &&
-      pendingFlags.every((flag) => backupIds.some((copy) =>
-        copy._id.equals(flag._id) &&
-        copy.key === flag.key &&
-        copy.enabled === flag.enabled &&
-        copy.environment === flag.environment
-      ));
-
-    if (backupCount !== pendingFlags.length || !backupMatches) {
-      throw new Error(
-        `Backup verification failed: expected ${pendingFlags.length} matching documents, found ${backupCount}.`
-      );
-    }
-
-    console.log(`Backup verified: ${backupCount} document(s).`);
-
-    let migratedCount = 0;
-
-    for (const flag of pendingFlags) {
-      const environmentConfigs = {};
-
-      for (const environment of environments) {
-        environmentConfigs[environment] = {
-          enabled:
-            environment === flag.environment ? flag.enabled : false,
-          rolloutPercentage: 0,
-          allowlist: [],
-          denylist: [],
-        };
-      }
-
-      const result = await collection.updateOne(
-        {
-          _id: flag._id,
-          environments: { $exists: false },
-          environment: flag.environment,
-          enabled: flag.enabled,
-        },
-        {
-          $set: { environments: environmentConfigs },
-          $unset: {
-            enabled: "",
-            environment: "",
-          },
-        }
-      );
-
-      if (result.modifiedCount !== 1) {
-        throw new Error(
-          `Migration stopped at "${flag.key}". Check the backup before retrying.`
-        );
-      }
-
-      migratedCount++;
-      console.log(`MIGRATED: ${flag.key}`);
-    }
-
-    console.log(`Migration completed: ${migratedCount} document(s).`);
+async function main() {
+  const options = parseArguments(process.argv.slice(2));
+  if (!options.apply && !options.dryRun) {
+    console.log("No migration performed. Use --dry-run to validate or --apply to write.");
+    return;
+  }
+  if (!process.env.MONGODB_URI) throw new Error("MONGODB_URI is missing from server/.env");
+  if (process.env.MONGODB_DNS_SERVER) {
+    require("node:dns").setServers([process.env.MONGODB_DNS_SERVER]);
+  }
+  await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
+  try {
+    await migrateFeatureFlags({
+      db: mongoose.connection.db,
+      apply: options.apply,
+      logger: console,
+    });
   } finally {
     await mongoose.disconnect();
   }
 }
 
-migrateFeatureFlags().catch((error) => {
-  console.error("Migration failed:", error.message);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error("Migration failed:", error.message);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { main, migrateFeatureFlags, parseArguments };

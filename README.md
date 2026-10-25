@@ -74,10 +74,20 @@ Environment updates use
 same path with `/toggle`. Evaluation is available at
 `GET /api/flags/evaluate/:key/:environmentName?userId=...`.
 
-To inspect a migration without writes, set `MONGODB_URI` to an isolated
-database and run `node src/scripts/migrateFeatureFlags.js --dry-run`.
-Never use a production URI for experiments. A live migration requires an
-explicit maintenance-window decision and is not part of normal startup.
+Migration commands are explicit:
+
+```powershell
+node src/scripts/migrateFeatureFlags.js --dry-run
+node src/scripts/migrateFeatureFlags.js --apply
+```
+
+No arguments perform no migration. `--dry-run` validates and reports without
+creating a backup collection or writing feature flags. `--apply` is required
+before any writes. The live path creates and deeply verifies a separate
+backup, uses conditional atomic updates, and reports partial progress if a
+later document conflicts. Preserve the backup, resolve validation or
+concurrency conflicts, and inspect the backup before retrying. Use an
+isolated database for tests and never use a production URI for experiments.
 
 `MONGODB_DNS_SERVER` is optional. Leave it unset to use the operating
 system resolver; set it only when the local resolver cannot resolve the
