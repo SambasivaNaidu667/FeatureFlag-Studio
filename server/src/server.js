@@ -2,12 +2,13 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 
+dotenv.config();
+
+const connectDB = require("./config/db");
 const {
   notFoundHandler,
   errorHandler,
 } = require("./middleware/errorHandler");
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -21,10 +22,16 @@ app.use(
 app.use(express.json());
 
 app.get("/api/health", (req, res) => {
+  const mongoose = require("mongoose");
+
   res.status(200).json({
     success: true,
     message: "FeatureFlag Studio API is running",
     environment: process.env.NODE_ENV || "development",
+    database:
+      mongoose.connection.readyState === 1
+        ? "connected"
+        : "disconnected",
     timestamp: new Date().toISOString(),
   });
 });
@@ -32,8 +39,19 @@ app.get("/api/health", (req, res) => {
 app.use(notFoundHandler);
 app.use(errorHandler);
 
-app.listen(PORT, () => {
-  console.log(
-    `FeatureFlag Studio API running at http://localhost:${PORT}`
-  );
-});
+async function startServer() {
+  try {
+    await connectDB();
+
+    app.listen(PORT, () => {
+      console.log(
+        `FeatureFlag Studio API running at http://localhost:${PORT}`
+      );
+    });
+  } catch (error) {
+    console.error("Failed to start the server:", error.message);
+    process.exit(1);
+  }
+}
+
+startServer();
