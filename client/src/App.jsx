@@ -32,6 +32,9 @@ const initialForm = {
   name: '',
   key: '',
   description: '',
+  rolloutPercentage: 0,
+  allowlist: '',
+  denylist: '',
 }
 
 function App() {
@@ -131,6 +134,9 @@ function App() {
       name: flag.name,
       key: flag.key,
       description: flag.description || '',
+      rolloutPercentage: flag.environments?.[environment]?.rolloutPercentage || 0,
+      allowlist: (flag.environments?.[environment]?.allowlist || []).join(', '),
+      denylist: (flag.environments?.[environment]?.denylist || []).join(', '),
     })
     setActionError('')
     setModalOpen(true)
@@ -151,19 +157,43 @@ function App() {
 
     try {
       const url = editingFlag ? `${API_URL}/${editingFlag._id}` : API_URL
+      const targeting = {
+        rolloutPercentage: Number(form.rolloutPercentage),
+        allowlist: form.allowlist
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean),
+        denylist: form.denylist
+          .split(',')
+          .map((id) => id.trim())
+          .filter(Boolean),
+      }
       const payload = editingFlag
-        ? form
-        : { name: form.name, key: form.key, description: form.description }
+        ? { name: form.name, key: form.key, description: form.description }
+        : {
+            name: form.name,
+            key: form.key,
+            description: form.description,
+            environments: {
+              [environment]: targeting,
+            },
+          }
 
       const result = await request(url, {
         method: editingFlag ? 'PATCH' : 'POST',
         body: JSON.stringify(payload),
       })
+      const savedResult = editingFlag
+        ? await request(`${API_URL}/${editingFlag._id}/environments/${environment}`, {
+            method: 'PATCH',
+            body: JSON.stringify(targeting),
+          })
+        : result
 
       if (editingFlag) {
         setFlags((current) =>
           current.map((flag) =>
-            flag._id === editingFlag._id ? result.data : flag
+            flag._id === editingFlag._id ? savedResult.data : flag
           )
         )
         setNotice('Feature flag updated successfully.')
@@ -633,6 +663,35 @@ function App() {
                   onChange={(event) => updateForm('description', event.target.value)}
                   placeholder="What does this flag control?"
                 />
+              </label>
+              <label className="form-field">
+                <span>{environment} rollout percentage</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={form.rolloutPercentage}
+                  onChange={(event) => updateForm('rolloutPercentage', event.target.value)}
+                />
+              </label>
+              <label className="form-field">
+                <span>Allowlist user IDs</span>
+                <input
+                  value={form.allowlist}
+                  onChange={(event) => updateForm('allowlist', event.target.value)}
+                  placeholder="user-1, user-2"
+                />
+                <small>Comma-separated IDs. Allowlisted users bypass rollout.</small>
+              </label>
+              <label className="form-field">
+                <span>Denylist user IDs</span>
+                <input
+                  value={form.denylist}
+                  onChange={(event) => updateForm('denylist', event.target.value)}
+                  placeholder="blocked-user"
+                />
+                <small>Denylisted users always receive the feature disabled.</small>
               </label>
               {actionError && <div className="form-error" role="alert">{actionError}</div>}
 
