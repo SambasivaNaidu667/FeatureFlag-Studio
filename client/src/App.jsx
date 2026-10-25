@@ -26,14 +26,12 @@ import './App.css'
 
 const API_URL = 'http://localhost:5000/api/flags'
 
-const environments = ['all', 'development', 'staging', 'production']
+const environments = ['development', 'staging', 'production']
 
 const initialForm = {
   name: '',
   key: '',
   description: '',
-  environment: 'development',
-  enabled: false,
 }
 
 function App() {
@@ -41,7 +39,7 @@ function App() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [search, setSearch] = useState('')
-  const [environment, setEnvironment] = useState('all')
+  const [environment, setEnvironment] = useState('development')
   const [statusFilter, setStatusFilter] = useState('all')
   const [modalOpen, setModalOpen] = useState(false)
   const [editingFlag, setEditingFlag] = useState(null)
@@ -75,7 +73,7 @@ function App() {
     try {
       const result = await request(API_URL)
       setFlags(result.data || [])
-    } catch (err) {
+    } catch {
       setError(
         'Could not connect to the API. Make sure your backend is running at localhost:5000.'
       )
@@ -85,7 +83,10 @@ function App() {
   }
 
   useEffect(() => {
+    // Initial data loading is an intentional state synchronization with the API.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadFlags()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const filteredFlags = useMemo(() => {
@@ -97,23 +98,25 @@ function App() {
         flag.key.toLowerCase().includes(query) ||
         (flag.description || '').toLowerCase().includes(query)
 
-      const matchesEnvironment =
-        environment === 'all' || flag.environment === environment
+      const config = flag.environments?.[environment] || {}
 
       const matchesStatus =
         statusFilter === 'all' ||
-        (statusFilter === 'enabled' && flag.enabled) ||
-        (statusFilter === 'disabled' && !flag.enabled)
+        (statusFilter === 'enabled' && config.enabled) ||
+        (statusFilter === 'disabled' && !config.enabled)
 
-      return matchesSearch && matchesEnvironment && matchesStatus
+      return matchesSearch && matchesStatus
     })
   }, [flags, search, environment, statusFilter])
 
-  const enabledCount = flags.filter((flag) => flag.enabled).length
-  const disabledCount = flags.length - enabledCount
-  const productionCount = flags.filter(
-    (flag) => flag.environment === 'production'
+  const enabledCount = flags.filter(
+    (flag) => flag.environments?.[environment]?.enabled
   ).length
+  const disabledCount = flags.length - enabledCount
+  const rolloutTotal = flags.reduce(
+    (total, flag) => total + (flag.environments?.[environment]?.rolloutPercentage || 0),
+    0
+  )
 
   function openCreateModal() {
     setEditingFlag(null)
@@ -128,8 +131,6 @@ function App() {
       name: flag.name,
       key: flag.key,
       description: flag.description || '',
-      environment: flag.environment,
-      enabled: flag.enabled,
     })
     setActionError('')
     setModalOpen(true)
@@ -149,13 +150,14 @@ function App() {
     setNotice('')
 
     try {
-      const url = editingFlag
-        ? `${API_URL}/${editingFlag._id}`
-        : API_URL
+      const url = editingFlag ? `${API_URL}/${editingFlag._id}` : API_URL
+      const payload = editingFlag
+        ? form
+        : { name: form.name, key: form.key, description: form.description }
 
       const result = await request(url, {
         method: editingFlag ? 'PATCH' : 'POST',
-        body: JSON.stringify(form),
+        body: JSON.stringify(payload),
       })
 
       if (editingFlag) {
@@ -184,9 +186,10 @@ function App() {
     setError('')
 
     try {
-      const result = await request(`${API_URL}/${flag._id}/toggle`, {
-        method: 'PATCH',
-      })
+      const result = await request(
+        `${API_URL}/${flag._id}/environments/${environment}/toggle`,
+        { method: 'PATCH' }
+      )
 
       setFlags((current) =>
         current.map((item) =>
@@ -194,7 +197,7 @@ function App() {
         )
       )
       setNotice(
-        `${result.data.name} is now ${result.data.enabled ? 'enabled' : 'disabled'}.`
+        `${result.data.name} is now ${result.configuration.enabled ? 'enabled' : 'disabled'} in ${environment}.`
       )
     } catch (err) {
       setError(err.message)
@@ -384,8 +387,8 @@ function App() {
                 <span className="stat-label">Production flags</span>
                 <span className="stat-icon blue"><Activity size={19} /></span>
               </div>
-              <div className="stat-number">{productionCount}</div>
-              <div className="stat-foot"><span className="stat-foot-dot blue-dot" /> Production environment</div>
+              <div className="stat-number">{rolloutTotal}%</div>
+              <div className="stat-foot"><span className="stat-foot-dot blue-dot" /> {environment} rollout total</div>
             </article>
           </section>
 
@@ -426,9 +429,7 @@ function App() {
                 >
                   {environments.map((item) => (
                     <option value={item} key={item}>
-                      {item === 'all'
-                        ? 'All environments'
-                        : item.charAt(0).toUpperCase() + item.slice(1)}
+                    {item.charAt(0).toUpperCase() + item.slice(1)}
                     </option>
                   ))}
                 </select>
@@ -487,9 +488,13 @@ function App() {
                   ) : (
                     filteredFlags.map((flag) => (
                       <tr key={flag._id}>
+                        {(() => {
+                          const config = flag.environments?.[environment] || {}
+                          return (
+                            <>
                         <td>
                           <div className="flag-name-cell">
-                            <div className={`flag-symbol ${flag.enabled ? 'symbol-on' : ''}`}>
+                            <div className={`flag-symbol ${config.enabled ? 'symbol-on' : ''}`}>
                               <Code2 size={18} />
                             </div>
                             <div className="flag-details">
@@ -500,25 +505,25 @@ function App() {
                           </div>
                         </td>
                         <td>
-                          <span className={`environment-tag env-${flag.environment}`}>
+                          <span className={`environment-tag env-${environment}`}>
                             <span />
-                            {flag.environment}
+                            {environment}
                           </span>
                         </td>
                         <td>
                           <div className="status-cell">
                             <button
-                              className={`toggle-switch ${flag.enabled ? 'is-on' : ''}`}
+                              className={`toggle-switch ${config.enabled ? 'is-on' : ''}`}
                               type="button"
                               role="switch"
-                              aria-checked={flag.enabled}
-                              aria-label={`${flag.enabled ? 'Disable' : 'Enable'} ${flag.name}`}
+                              aria-checked={config.enabled}
+                              aria-label={`${config.enabled ? 'Disable' : 'Enable'} ${flag.name}`}
                               onClick={() => toggleFlag(flag)}
                             >
                               <span />
                             </button>
-                            <span className={`status-text ${flag.enabled ? 'text-enabled' : ''}`}>
-                              {flag.enabled ? 'Enabled' : 'Disabled'}
+                            <span className={`status-text ${config.enabled ? 'text-enabled' : ''}`}>
+                              {config.enabled ? 'Enabled' : 'Disabled'} · {config.rolloutPercentage || 0}%
                             </span>
                           </div>
                         </td>
@@ -550,6 +555,9 @@ function App() {
                             </button>
                           </div>
                         </td>
+                            </>
+                          )
+                        })()}
                       </tr>
                     ))
                   )}
@@ -626,30 +634,6 @@ function App() {
                   placeholder="What does this flag control?"
                 />
               </label>
-              <label className="form-field">
-                <span>Environment</span>
-                <select
-                  value={form.environment}
-                  onChange={(event) => updateForm('environment', event.target.value)}
-                >
-                  <option value="development">Development</option>
-                  <option value="staging">Staging</option>
-                  <option value="production">Production</option>
-                </select>
-              </label>
-              <label className="form-checkbox">
-                <input
-                  type="checkbox"
-                  checked={form.enabled}
-                  onChange={(event) => updateForm('enabled', event.target.checked)}
-                />
-                <span className="checkbox-visual"><Check size={13} /></span>
-                <span>
-                  <strong>Enable this flag</strong>
-                  <small>Turn this feature on immediately.</small>
-                </span>
-              </label>
-
               {actionError && <div className="form-error" role="alert">{actionError}</div>}
 
               <div className="modal-actions">

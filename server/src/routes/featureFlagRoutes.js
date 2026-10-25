@@ -8,6 +8,9 @@ const {
   updateFlag,
   deleteFlag,
   toggleFlag,
+  updateEnvironment,
+  toggleEnvironment,
+  evaluate,
 } = require("../controllers/featureFlagController");
 
 const router = express.Router();
@@ -26,6 +29,9 @@ router.patch("/:id", updateFlag);
 
 // Enable or disable a feature flag
 router.patch("/:id/toggle", toggleFlag);
+router.patch("/:id/environments/:environmentName", updateEnvironment);
+router.patch("/:id/environments/:environmentName/toggle", toggleEnvironment);
+router.get("/evaluate/:key/:environmentName", evaluate);
 
 // Delete a feature flag
 router.delete("/:id", deleteFlag);

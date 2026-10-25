@@ -4,9 +4,9 @@ require("dotenv").config({
 });
 
 const mongoose = require("mongoose");
-const dns = require("node:dns");
-
-dns.setServers(["8.8.8.8"]);
+if (process.env.MONGODB_DNS_SERVER) {
+  require("node:dns").setServers([process.env.MONGODB_DNS_SERVER]);
+}
 
 const environments = ["development", "staging", "production"];
 const dryRun = process.argv.includes("--dry-run");
@@ -29,26 +29,25 @@ async function migrateFeatureFlags() {
       `Mode: ${dryRun ? "DRY RUN - no writes" : "LIVE MIGRATION"}`
     );
 
-    // Validate every legacy document before writing anything.
+    const validationErrors = [];
     for (const flag of flags) {
       if (flag.environments) {
         continue;
       }
 
       if (!environments.includes(flag.environment)) {
-        throw new Error(
-          `Flag "${flag.key}" has an unsupported environment.`
+        validationErrors.push(
+          `${flag._id}: unsupported environment "${flag.environment}"`
         );
       }
 
       if (typeof flag.enabled !== "boolean") {
-        throw new Error(
-          `Flag "${flag.key}" has an invalid enabled value.`
-        );
+        validationErrors.push(`${flag._id}: enabled must be a boolean`);
       }
     }
 
     const pendingFlags = flags.filter((flag) => !flag.environments);
+    const alreadyMigrated = flags.length - pendingFlags.length;
 
     if (dryRun) {
       for (const flag of pendingFlags) {
@@ -58,10 +57,16 @@ async function migrateFeatureFlags() {
       }
 
       console.log(`Would migrate: ${pendingFlags.length}`);
-      console.log(
-        `Already migrated: ${flags.length - pendingFlags.length}`
-      );
+      console.log(`Already migrated: ${alreadyMigrated}`);
+      console.log(`Requires attention: ${validationErrors.length}`);
+      validationErrors.forEach((error) => console.log(`ATTENTION: ${error}`));
       return;
+    }
+
+    if (validationErrors.length) {
+      throw new Error(
+        `Migration aborted before writes:\n${validationErrors.join("\n")}`
+      );
     }
 
     if (pendingFlags.length === 0) {
@@ -75,16 +80,31 @@ async function migrateFeatureFlags() {
         .toISOString()
         .replace(/[-:.TZ]/g, "")}`;
 
-    const backupCollection =
-      mongoose.connection.collection(backupCollectionName);
+    const existingBackup = await mongoose.connection
+      .listCollections({ name: backupCollectionName })
+      .hasNext();
+    if (existingBackup) {
+      throw new Error(`Backup collection already exists: ${backupCollectionName}`);
+    }
+    const backupCollection = mongoose.connection.collection(backupCollectionName);
 
     await backupCollection.insertMany(pendingFlags);
 
     const backupCount = await backupCollection.countDocuments();
+    const backupIds = await backupCollection
+      .find({}, { projection: { _id: 1, key: 1, enabled: 1, environment: 1 } })
+      .toArray();
+    const backupMatches = backupIds.length === pendingFlags.length &&
+      pendingFlags.every((flag) => backupIds.some((copy) =>
+        copy._id.equals(flag._id) &&
+        copy.key === flag.key &&
+        copy.enabled === flag.enabled &&
+        copy.environment === flag.environment
+      ));
 
-    if (backupCount !== pendingFlags.length) {
+    if (backupCount !== pendingFlags.length || !backupMatches) {
       throw new Error(
-        `Backup verification failed: expected ${pendingFlags.length}, found ${backupCount}.`
+        `Backup verification failed: expected ${pendingFlags.length} matching documents, found ${backupCount}.`
       );
     }
 
