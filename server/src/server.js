@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const featureFlagRoutes = require("./routes/featureFlagRoutes");
 
 dotenv.config();
 
@@ -20,6 +21,7 @@ app.use(
 );
 
 app.use(express.json());
+app.use("/api/flags", featureFlagRoutes);
 
 app.get("/api/health", (req, res) => {
   const mongoose = require("mongoose");
