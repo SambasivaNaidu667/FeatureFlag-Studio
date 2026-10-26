@@ -53,19 +53,49 @@ function validateTargetingList(value, path) {
   return null;
 }
 
+
 function validateEnvironmentConfig(config, environment) {
+  // 1. Ensure the configuration is a plain object.
   if (!isPlainObject(config)) {
     return `${environment} configuration must be an object`;
   }
-  const required = ["enabled", "rolloutPercentage", "allowlist", "denylist"];
+
+  // 2. Reject fields that are not supported by the schema.
+  const allowed = new Set([
+    "enabled",
+    "rolloutPercentage",
+    "allowlist",
+    "denylist",
+  ]);
+
+  const unexpected = Object.keys(config).find(
+    (field) => !allowed.has(field)
+  );
+
+  if (unexpected) {
+    return `${environment} has unexpected field "${unexpected}"`;
+  }
+
+  // 3. Ensure every required field exists.
+  const required = [
+    "enabled",
+    "rolloutPercentage",
+    "allowlist",
+    "denylist",
+  ];
+
   for (const field of required) {
     if (!hasOwn(config, field)) {
       return `${environment}.${field} is required`;
     }
   }
+
+  // 4. Validate the enabled value.
   if (typeof config.enabled !== "boolean") {
     return `${environment}.enabled must be a boolean`;
   }
+
+  // 5. Validate the rollout percentage.
   if (
     typeof config.rolloutPercentage !== "number" ||
     !Number.isFinite(config.rolloutPercentage) ||
@@ -74,10 +104,28 @@ function validateEnvironmentConfig(config, environment) {
   ) {
     return `${environment}.rolloutPercentage must be a finite number between 0 and 100`;
   }
-  return (
-    validateTargetingList(config.allowlist, `${environment}.allowlist`) ||
-    validateTargetingList(config.denylist, `${environment}.denylist`)
+
+  // 6. Validate allowlist and denylist.
+  const allowlistError = validateTargetingList(
+    config.allowlist,
+    `${environment}.allowlist`
   );
+
+  if (allowlistError) {
+    return allowlistError;
+  }
+
+  const denylistError = validateTargetingList(
+    config.denylist,
+    `${environment}.denylist`
+  );
+
+  if (denylistError) {
+    return denylistError;
+  }
+
+  // All validations passed.
+  return null;
 }
 
 function validateLegacyDocument(flag) {

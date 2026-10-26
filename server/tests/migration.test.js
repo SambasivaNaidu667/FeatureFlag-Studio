@@ -38,9 +38,20 @@ function migrated(overrides = {}) {
 function fakeDb(flags, { backupCopy } = {}) {
   const collections = new Map([["featureflags", { documents: flags }]]);
   const updates = [];
+  const writes = {
+    insertMany: 0,
+    insertOne: 0,
+    updateOne: 0,
+    updateMany: 0,
+    replaceOne: 0,
+    deleteOne: 0,
+    deleteMany: 0,
+    createCollection: 0,
+  };
   const handles = new Map();
   const db = {
     updates,
+    writes,
     listCollections(filter) {
       const exists = collections.has(filter.name);
       return {
@@ -57,18 +68,38 @@ function fakeDb(flags, { backupCopy } = {}) {
       const handle = {
         find: () => ({ toArray: async () => item.documents }),
         insertMany: async (documents) => {
+          writes.insertMany += 1;
           item.documents = backupCopy || documents.map((document) => ({ ...document }));
         },
+        insertOne: async () => { writes.insertOne += 1; },
         updateOne: async (filter) => {
+          writes.updateOne += 1;
           updates.push(filter);
           return { matchedCount: 1, modifiedCount: 1 };
         },
+        updateMany: async () => { writes.updateMany += 1; },
+        replaceOne: async () => { writes.replaceOne += 1; },
+        deleteOne: async () => { writes.deleteOne += 1; },
+        deleteMany: async () => { writes.deleteMany += 1; },
       };
       handles.set(name, handle);
       return handle;
     },
   };
   return db;
+}
+
+function assertNoWrites(db) {
+  assert.deepEqual(db.writes, {
+    insertMany: 0,
+    insertOne: 0,
+    updateOne: 0,
+    updateMany: 0,
+    replaceOne: 0,
+    deleteOne: 0,
+    deleteMany: 0,
+    createCollection: 0,
+  });
 }
 
 test("enabled legacy environments receive 100 percent rollout", () => {
@@ -131,6 +162,27 @@ test("legacy and migrated document validation rejects malformed shapes", () => {
   assert.match(
     validateMigratedDocument({ ...migrated(), legacyTargeting: [] }),
     /unexpected field/
+  );
+});
+
+test("migrated validation rejects unknown nested environment fields", () => {
+  for (const environment of ["production", "development", "staging"]) {
+    const flag = migrated();
+    flag.environments[environment].debug = true;
+    assert.equal(
+      validateMigratedDocument(flag),
+      `${environment} has unexpected field "debug"`
+    );
+  }
+
+  const valid = migrated();
+  assert.equal(validateMigratedDocument(valid), null);
+
+  const missingRequired = migrated();
+  delete missingRequired.environments.production.denylist;
+  assert.equal(
+    validateMigratedDocument(missingRequired),
+    "production.denylist is required"
   );
 });
 
@@ -212,6 +264,7 @@ test("migration detects conflicts, supports dry-run, and skips valid migrated re
   const dryRun = await migrateFeatureFlags({ db: dryRunDb, logger: { log() {} } });
   assert.equal(dryRun.migratedCount, 0);
   assert.equal(dryRunDb.updates.length, 0);
+  assertNoWrites(dryRunDb);
 
   const migratedDb = fakeDb([migrated()]);
   const result = await migrateFeatureFlags({ db: migratedDb, apply: true, logger: { log() {} } });

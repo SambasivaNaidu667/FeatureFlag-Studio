@@ -168,16 +168,42 @@ function App() {
           .map((id) => id.trim())
           .filter(Boolean),
       }
-      const payload = editingFlag
-        ? { name: form.name, key: form.key, description: form.description }
-        : {
-            name: form.name,
-            key: form.key,
-            description: form.description,
-            environments: {
-              [environment]: targeting,
-            },
-          }
+
+const payload = editingFlag
+  ? {
+      name: form.name,
+      key: form.key,
+      description: form.description,
+    }
+  : {
+      name: form.name,
+      key: form.key,
+      description: form.description,
+      environments: {
+        development: {
+          enabled: false,
+          rolloutPercentage: 0,
+          allowlist: [],
+          denylist: [],
+        },
+        staging: {
+          enabled: false,
+          rolloutPercentage: 0,
+          allowlist: [],
+          denylist: [],
+        },
+        production: {
+          enabled: false,
+          rolloutPercentage: 0,
+          allowlist: [],
+          denylist: [],
+        },
+        [environment]: {
+          enabled: false,
+          ...targeting,
+        },
+      },
+    };
 
       const result = await request(url, {
         method: editingFlag ? 'PATCH' : 'POST',
