@@ -1,10 +1,15 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const express = require("express");
 const {
   createRateLimiter,
   rateLimitFromEnv,
 } = require("../src/middleware/rateLimiter");
 const { publicEvaluationResult } = require("../src/controllers/featureFlagController");
+const {
+  resolveTrustProxy,
+  configureTrustProxy,
+} = require("../src/server");
 
 function responseRecorder() {
   const headers = {};
@@ -104,4 +109,88 @@ test("malformed, fractional, zero, and negative limits use safe defaults", () =>
   if (previous === undefined) delete process.env.TEST_RATE_LIMIT;
   else process.env.TEST_RATE_LIMIT = previous;
   delete process.env.TEST_RATE_WINDOW;
+});
+
+test("resolveTrustProxy defaults to disabled and validates explicit hop counts and subnets", () => {
+  assert.equal(resolveTrustProxy(undefined), false);
+  assert.equal(resolveTrustProxy(""), false);
+  assert.equal(resolveTrustProxy("false"), false);
+  assert.equal(resolveTrustProxy("FALSE"), false);
+  assert.equal(resolveTrustProxy("0"), false);
+  assert.equal(resolveTrustProxy(false), false);
+
+  assert.equal(resolveTrustProxy(1), 1);
+  assert.equal(resolveTrustProxy("1"), 1);
+  assert.equal(resolveTrustProxy(" 2 "), 2);
+  assert.equal(resolveTrustProxy("loopback"), "loopback");
+  assert.equal(resolveTrustProxy("LINKLOCAL"), "linklocal");
+  assert.equal(resolveTrustProxy("uniquelocal"), "uniquelocal");
+
+  for (const unsafeValue of ["true", true, "*", "-1", "01", "all", 0, -2, 1.5]) {
+    assert.throws(
+      () => resolveTrustProxy(unsafeValue),
+      /Invalid TRUST_PROXY value/i
+    );
+  }
+});
+
+test("proxy-aware rate limiting ignores X-Forwarded-For by default and uses it only when TRUST_PROXY is enabled", async () => {
+  async function withServer(trustProxySetting, fn) {
+    const proxyApp = express();
+    configureTrustProxy(proxyApp, trustProxySetting);
+    proxyApp.use(
+      createRateLimiter({
+        max: 1,
+        windowMs: 60_000,
+      })
+    );
+    proxyApp.get("/probe", (req, res) => {
+      res.status(200).json({ ip: req.ip });
+    });
+
+    const server = await new Promise((resolve) => {
+      const instance = proxyApp.listen(0, "127.0.0.1", () => resolve(instance));
+    });
+    const { port } = server.address();
+    try {
+      await fn(`http://127.0.0.1:${port}/probe`);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }
+
+  // Default (TRUST_PROXY=false): spoofed X-Forwarded-For headers cannot bypass rate limiting
+  await withServer(false, async (url) => {
+    const first = await fetch(url, {
+      headers: { "X-Forwarded-For": "203.0.113.10" },
+    });
+    assert.equal(first.status, 200);
+
+    const secondWithDifferentSpoofedIp = await fetch(url, {
+      headers: { "X-Forwarded-For": "198.51.100.25" },
+    });
+    assert.equal(secondWithDifferentSpoofedIp.status, 429);
+  });
+
+  // Explicit single-hop proxy (TRUST_PROXY=1): distinct forwarded client IPs have separate buckets
+  await withServer(1, async (url) => {
+    const clientAFirst = await fetch(url, {
+      headers: { "X-Forwarded-For": "203.0.113.10" },
+    });
+    assert.equal(clientAFirst.status, 200);
+    const bodyA = await clientAFirst.json();
+    assert.equal(bodyA.ip, "203.0.113.10");
+
+    const clientBFirst = await fetch(url, {
+      headers: { "X-Forwarded-For": "198.51.100.25" },
+    });
+    assert.equal(clientBFirst.status, 200);
+    const bodyB = await clientBFirst.json();
+    assert.equal(bodyB.ip, "198.51.100.25");
+
+    const clientASecond = await fetch(url, {
+      headers: { "X-Forwarded-For": "203.0.113.10" },
+    });
+    assert.equal(clientASecond.status, 429);
+  });
 });

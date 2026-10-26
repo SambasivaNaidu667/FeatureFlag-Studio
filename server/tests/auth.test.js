@@ -806,3 +806,113 @@ test("permanent user deletion enforces deactivated-only, admin-only, self/last-a
   assert.equal(deletionEvent.actorEmail, "admin@example.com");
   assert.equal(String(deletionEvent.actor), String(admin.user._id));
 });
+
+test("prevent non-admins from changing flag keys when enabled in production while allowing safe edits and admin overrides", async () => {
+  const admin = await createTestUser({
+    name: "Primary Admin",
+    email: "admin@example.com",
+    role: "admin",
+  });
+  const dev = await createTestUser({
+    name: "Developer User",
+    email: "dev@example.com",
+    role: "developer",
+  });
+  const viewer = await createTestUser({
+    name: "Viewer User",
+    email: "viewer@example.com",
+    role: "viewer",
+  });
+
+  // 1. Developer creates a flag that is disabled in production and can rename its key
+  const nonProdCreate = await api("/api/flags", {
+    method: "POST",
+    token: dev.token,
+    body: {
+      name: "Search V2",
+      key: "search_v2_draft",
+      description: "Initial draft key",
+      environments: {
+        development: { enabled: true, rolloutPercentage: 100, allowlist: [], denylist: [] },
+        staging: { enabled: true, rolloutPercentage: 50, allowlist: [], denylist: [] },
+        production: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+      },
+    },
+  });
+  assert.equal(nonProdCreate.status, 201);
+  const flagId = nonProdCreate.body.data._id;
+
+  const devAllowedKeyRename = await api(`/api/flags/${flagId}`, {
+    method: "PATCH",
+    token: dev.token,
+    body: {
+      name: "Search V2 Ready",
+      key: "search_v2",
+    },
+  });
+  assert.equal(devAllowedKeyRename.status, 200);
+  assert.equal(devAllowedKeyRename.body.data.key, "search_v2");
+  assert.equal(devAllowedKeyRename.body.data.name, "Search V2 Ready");
+
+  // 2. Admin enables the flag in production
+  const enableProd = await api(`/api/flags/${flagId}/environments/production/toggle`, {
+    method: "PATCH",
+    token: admin.token,
+  });
+  assert.equal(enableProd.status, 200);
+  assert.equal(enableProd.body.data.environments.production.enabled, true);
+
+  // 3. Developer attempts to change the key on the production-enabled flag (including mixed fields) -> 403 and no partial write
+  const devBlockedKeyRename = await api(`/api/flags/${flagId}`, {
+    method: "PATCH",
+    token: dev.token,
+    body: {
+      name: "Should Not Persist",
+      key: "search_v2_renamed_by_dev",
+      description: "Attempted bypass with extra fields",
+    },
+  });
+  assert.equal(devBlockedKeyRename.status, 403);
+  assert.match(
+    devBlockedKeyRename.body.message,
+    /Only administrators can change the key of a flag enabled in production/i
+  );
+
+  const storedAfterBlocked = await FeatureFlag.findById(flagId);
+  assert.equal(storedAfterBlocked.key, "search_v2");
+  assert.equal(storedAfterBlocked.name, "Search V2 Ready");
+  assert.equal(storedAfterBlocked.description, "Initial draft key");
+
+  // 4. Viewer is also blocked from changing the key
+  const viewerBlocked = await api(`/api/flags/${flagId}`, {
+    method: "PATCH",
+    token: viewer.token,
+    body: { key: "search_v2_viewer" },
+  });
+  assert.equal(viewerBlocked.status, 403);
+
+  // 5. Developer can still update name/description on a production-enabled flag when key is omitted or unchanged
+  const devMetadataOnly = await api(`/api/flags/${flagId}`, {
+    method: "PATCH",
+    token: dev.token,
+    body: {
+      name: "Search V2 Live",
+      key: "  SEARCH_V2  ",
+      description: "Updated description without changing key",
+    },
+  });
+  assert.equal(devMetadataOnly.status, 200);
+  assert.equal(devMetadataOnly.body.data.key, "search_v2");
+  assert.equal(devMetadataOnly.body.data.name, "Search V2 Live");
+
+  // 6. Admin is permitted to change the key on a production-enabled flag when valid
+  const adminKeyRename = await api(`/api/flags/${flagId}`, {
+    method: "PATCH",
+    token: admin.token,
+    body: {
+      key: "search_v2_prod",
+    },
+  });
+  assert.equal(adminKeyRename.status, 200);
+  assert.equal(adminKeyRename.body.data.key, "search_v2_prod");
+});

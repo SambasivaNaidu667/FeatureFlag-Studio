@@ -22,7 +22,53 @@ const {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+const NAMED_TRUST_PROXY_SUBNETS = new Set([
+  "loopback",
+  "linklocal",
+  "uniquelocal",
+]);
+
+function resolveTrustProxy(value = process.env.TRUST_PROXY) {
+  if (value === undefined || value === null || value === false) {
+    return false;
+  }
+  if (typeof value === "number") {
+    if (Number.isInteger(value) && value > 0) {
+      return value;
+    }
+    throw new Error(
+      'Invalid TRUST_PROXY value. Use "false" (default), a positive integer hop count (such as "1"), or "loopback", "linklocal", or "uniquelocal".'
+    );
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "" || normalized === "false" || normalized === "0") {
+      return false;
+    }
+    if (/^[1-9]\d*$/.test(normalized)) {
+      return Number(normalized);
+    }
+    if (NAMED_TRUST_PROXY_SUBNETS.has(normalized)) {
+      return normalized;
+    }
+  }
+  throw new Error(
+    'Invalid TRUST_PROXY value. Use "false" (default), a positive integer hop count (such as "1"), or "loopback", "linklocal", or "uniquelocal". Do not use "true" or "*".'
+  );
+}
+
+function configureTrustProxy(targetApp = app, value = process.env.TRUST_PROXY) {
+  const resolved = resolveTrustProxy(value);
+  targetApp.set("trust proxy", resolved);
+  return resolved;
+}
+
 app.disable("x-powered-by");
+try {
+  configureTrustProxy(app, process.env.TRUST_PROXY);
+} catch {
+  app.set("trust proxy", false);
+}
 
 const allowedOrigins = (
   process.env.CLIENT_ORIGIN ||
@@ -69,6 +115,7 @@ app.use(errorHandler);
 
 async function startServer() {
   try {
+    configureTrustProxy(app, process.env.TRUST_PROXY);
     validateAuthConfig(getAuthConfig());
     await connectDB();
 
@@ -97,4 +144,4 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { app, startServer };
+module.exports = { app, startServer, resolveTrustProxy, configureTrustProxy };

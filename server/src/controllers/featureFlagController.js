@@ -196,8 +196,30 @@ async function updateFlag(req, res, next) {
         message: "Only name, key, and description may be updated",
       });
     }
+    const existing = await FeatureFlag.findById(req.params.id);
+    if (!existing) {
+      return res.status(404).json({ success: false, message: "Feature flag not found" });
+    }
+    if (Object.hasOwn(updates, "key")) {
+      const normalizedIncomingKey =
+        typeof updates.key === "string"
+          ? updates.key.trim().toLowerCase()
+          : updates.key;
+      const isChangingKey = normalizedIncomingKey !== existing.key;
+      if (
+        isChangingKey &&
+        existing.environments?.production?.enabled === true &&
+        !can(req.user?.role, "flags:production")
+      ) {
+        return res.status(403).json({
+          success: false,
+          message:
+            "Only administrators can change the key of a flag enabled in production",
+        });
+      }
+    }
     const flag = await FeatureFlag.findByIdAndUpdate(req.params.id, updates, {
-      new: true,
+      returnDocument: "after",
       runValidators: true,
       context: "query",
     });
@@ -248,7 +270,7 @@ async function updateEnvironment(req, res, next) {
     const flag = await FeatureFlag.findOneAndUpdate(
       { _id: req.params.id },
       { $set: updates },
-      { new: true, runValidators: true, context: "query" }
+      { returnDocument: "after", runValidators: true, context: "query" }
     );
     if (!flag) {
       return res.status(404).json({ success: false, message: "Feature flag not found" });
@@ -292,7 +314,7 @@ async function toggleEnvironment(req, res, next) {
     const updated = await FeatureFlag.findOneAndUpdate(
       { _id: req.params.id },
       { $set: { [path]: !flag.environments[req.params.environmentName].enabled } },
-      { new: true, runValidators: true }
+      { returnDocument: "after", runValidators: true }
     );
     const enabled = updated.environments[req.params.environmentName].enabled;
     await recordAudit(req.user, {
