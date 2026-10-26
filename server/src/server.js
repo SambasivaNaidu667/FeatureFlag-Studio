@@ -1,9 +1,14 @@
+
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
-const featureFlagRoutes = require("./routes/featureFlagRoutes");
 
+// Load environment variables before importing routes and middleware.
 dotenv.config();
+
+const featureFlagRoutes = require("./routes/featureFlagRoutes");
+const authRoutes = require("./routes/authRoutes");
+const { validateAuthConfig, getAuthConfig } = require("./auth/auth");
 
 const connectDB = require("./config/db");
 const {
@@ -14,16 +19,20 @@ const {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: [
-      "http://localhost:5173",
-      "http://localhost:5174",
-    ],
+    origin: allowedOrigins,
   })
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
+
+app.use("/api/auth", authRoutes);
 app.use("/api/flags", featureFlagRoutes);
 
 app.get("/api/health", (req, res) => {
@@ -46,6 +55,7 @@ app.use(errorHandler);
 
 async function startServer() {
   try {
+    validateAuthConfig(getAuthConfig());
     await connectDB();
 
     app.listen(PORT, () => {
@@ -59,4 +69,8 @@ async function startServer() {
   }
 }
 
-startServer();
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = { app, startServer };

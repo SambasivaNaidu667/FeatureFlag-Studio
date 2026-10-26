@@ -1,5 +1,7 @@
 
 const express = require("express");
+const { requireAuth } = require("../auth/auth");
+const { rateLimitFromEnv } = require("../middleware/rateLimiter");
 
 const {
   createFlag,
@@ -14,26 +16,30 @@ const {
 } = require("../controllers/featureFlagController");
 
 const router = express.Router();
+const evaluationRateLimiter = rateLimitFromEnv({
+  maxEnv: "EVALUATION_RATE_LIMIT_MAX",
+  windowEnv: "EVALUATION_RATE_LIMIT_WINDOW_MS",
+  defaultMax: 300,
+  defaultWindowMs: 60 * 1000,
+  message: "Too many evaluation requests, please try again later",
+});
 
-// Create a feature flag
+// Evaluation is intentionally public and returns only the boolean decision.
+router.get(
+  "/evaluate/:key/:environmentName",
+  evaluationRateLimiter,
+  evaluate
+);
+
+// All flag-management and configuration routes require an admin token.
+router.use(requireAuth);
 router.post("/", createFlag);
-
-// Get all feature flags
 router.get("/", getAllFlags);
-
-// Get one feature flag by ID
 router.get("/:id", getFlagById);
-
-// Update a feature flag
 router.patch("/:id", updateFlag);
-
-// Enable or disable a feature flag
 router.patch("/:id/toggle", toggleFlag);
 router.patch("/:id/environments/:environmentName", updateEnvironment);
 router.patch("/:id/environments/:environmentName/toggle", toggleEnvironment);
-router.get("/evaluate/:key/:environmentName", evaluate);
-
-// Delete a feature flag
 router.delete("/:id", deleteFlag);
 
 module.exports = router;

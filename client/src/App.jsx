@@ -12,7 +12,6 @@ import {
   FlaskConical,
   LayoutDashboard,
   LoaderCircle,
-  MoreHorizontal,
   Plus,
   Search,
   Settings,
@@ -24,7 +23,10 @@ import {
 } from 'lucide-react'
 import './App.css'
 
-const API_URL = 'http://localhost:5000/api/flags'
+const API_ROOT = (
+  import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000/api'
+).replace(/\/$/, '')
+const API_URL = `${API_ROOT}/flags`
 
 const environments = ['development', 'staging', 'production']
 
@@ -38,6 +40,10 @@ const initialForm = {
 }
 
 function App() {
+  const [accessToken, setAccessToken] = useState('')
+  const [credentials, setCredentials] = useState({ username: '', password: '' })
+  const [loginError, setLoginError] = useState('')
+  const [loggingIn, setLoggingIn] = useState(false)
   const [flags, setFlags] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -52,17 +58,24 @@ function App() {
   const [notice, setNotice] = useState('')
 
   async function request(url, options = {}) {
+    const headers = {
+      'Content-Type': 'application/json',
+      ...options.headers,
+    }
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`
+
     const response = await fetch(url, {
       ...options,
-      headers: {
-        'Content-Type': 'application/json',
-        ...options.headers,
-      },
+      headers,
     })
 
     const result = await response.json().catch(() => ({}))
 
     if (!response.ok) {
+      if (response.status === 401 && accessToken) {
+  setLoginError('Your session expired. Please sign in again.')
+  setAccessToken('')
+}
       throw new Error(result.message || 'Something went wrong')
     }
 
@@ -86,11 +99,39 @@ function App() {
   }
 
   useEffect(() => {
-    // Initial data loading is an intentional state synchronization with the API.
+    // Loading data after authentication is an intentional API synchronization.
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadFlags()
+    if (accessToken) loadFlags()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [accessToken])
+
+  async function handleLogin(event) {
+    event.preventDefault()
+    setLoggingIn(true)
+    setLoginError('')
+    try {
+      const response = await fetch(`${API_ROOT}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credentials),
+      })
+      const result = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(result.message || 'Sign-in failed')
+      setAccessToken(result.data.accessToken)
+      setCredentials({ username: '', password: '' })
+    } catch (err) {
+      setLoginError(err.message)
+    } finally {
+      setLoggingIn(false)
+    }
+  }
+
+  function logout() {
+    setAccessToken('')
+    setFlags([])
+    setNotice('')
+    setError('')
+  }
 
   const filteredFlags = useMemo(() => {
     return flags.filter((flag) => {
@@ -120,6 +161,39 @@ function App() {
     (total, flag) => total + (flag.environments?.[environment]?.rolloutPercentage || 0),
     0
   )
+
+  if (!accessToken) {
+    return (
+      <main className="login-shell">
+        <form className="login-card" onSubmit={handleLogin}>
+          <div className="eyebrow"><span /> ADMIN ACCESS</div>
+          <h1>Sign in<span className="heading-period">.</span></h1>
+          <p className="page-subtitle">Sign in to manage feature flags.</p>
+          <label htmlFor="username">Username</label>
+          <input
+            id="username"
+            autoComplete="username"
+            value={credentials.username}
+            onChange={(event) => setCredentials({ ...credentials, username: event.target.value })}
+            required
+          />
+          <label htmlFor="password">Password</label>
+          <input
+            id="password"
+            type="password"
+            autoComplete="current-password"
+            value={credentials.password}
+            onChange={(event) => setCredentials({ ...credentials, password: event.target.value })}
+            required
+          />
+          {loginError && <div className="notice error-notice" role="alert">{loginError}</div>}
+          <button className="primary-button login-button" type="submit" disabled={loggingIn}>
+            {loggingIn ? 'Signing in…' : 'Sign in'}
+          </button>
+        </form>
+      </main>
+    )
+  }
 
   function openCreateModal() {
     setEditingFlag(null)
@@ -357,7 +431,7 @@ const payload = editingFlag
               <strong>Studio Admin</strong>
               <small>Local workspace</small>
             </div>
-            <MoreHorizontal size={19} />
+            <button className="logout-button" type="button" onClick={logout}>Sign out</button>
           </div>
         </div>
       </aside>

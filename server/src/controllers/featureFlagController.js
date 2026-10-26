@@ -10,6 +10,10 @@ const environmentFields = [
   "denylist",
 ];
 
+function publicEvaluationResult(result) {
+  return { value: result.value };
+}
+
 function invalidId(res, id) {
   if (!mongoose.isValidObjectId(id)) {
     res.status(400).json({ success: false, message: "Invalid feature flag ID" });
@@ -222,7 +226,10 @@ async function evaluate(req, res, next) {
       userId: req.query.userId,
       config: flag.environments[req.params.environmentName],
     });
-    return res.status(200).json({ success: true, data: result });
+    return res.status(200).json({
+      success: true,
+      data: publicEvaluationResult(result),
+    });
   } catch (error) {
     return next(error);
   }
@@ -249,4 +256,5 @@ module.exports = {
   toggleFlag,
   evaluate,
   deleteFlag,
+  publicEvaluationResult,
 };
