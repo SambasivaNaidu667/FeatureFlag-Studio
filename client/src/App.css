@@ -333,3 +333,32 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .rollout-preview { align-self: auto; }
   .flag-modal { padding: 21px 17px; }
 }
+
+
+/* Multi-user & RBAC */
+.auth-mode-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 20px; padding: 4px; background: #0a0d14; border: 1px solid #263142; border-radius: 9px; }
+.auth-mode-tabs button { min-height: 34px; color: var(--muted); font-size: 11px; font-weight: 700; background: transparent; border: 0; border-radius: 6px; transition: .15s ease; }
+.auth-mode-tabs button.active { color: white; background: #241e3d; border: 1px solid #483b78; }
+.role-badge { display: inline-flex; align-items: center; padding: 4px 8px; font-family: var(--mono); font-size: 9px; font-weight: 500; letter-spacing: .8px; text-transform: uppercase; border: 1px solid; border-radius: 5px; }
+.role-badge.role-admin { color: #c7b8ff; background: #282149; border-color: #4c3d82; }
+.role-badge.role-developer { color: #8ee6f2; background: #14333b; border-color: #2c6470; }
+.role-badge.role-viewer { color: #a7b3c6; background: #18202e; border-color: #2e3b50; }
+.info-notice { color: #b8e7f2; background: #11242c; border-color: #274f5c; }
+.status-pill { display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px; font-family: var(--mono); font-size: 9px; border: 1px solid; border-radius: 5px; }
+.status-pill > span { width: 5px; height: 5px; border-radius: 50%; }
+.status-pill.status-active { color: #6cddb0; background: #16332a; border-color: #2b614c; }
+.status-pill.status-active > span { background: var(--green); }
+.status-pill.status-deactivated { color: #ffa9b4; background: #2c1821; border-color: #5a313e; }
+.status-pill.status-deactivated > span { background: #ff7a8a; }
+.role-select { display: inline-flex; width: auto; }
+.small-action-button { min-height: 31px; padding: 0 11px; font-size: 10px; }
+.modal-select { width: 100%; min-height: 40px; padding: 0 11px; color: var(--text); font-size: 11px; background: #0a0d14; border: 1px solid #2a3445; border-radius: 8px; outline: 0; }
+.settings-panel { padding: 26px; }
+.settings-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 28px; }
+.settings-grid h3 { margin: 10px 0 6px; font-size: 18px; }
+.permission-list { display: flex; flex-wrap: wrap; gap: 7px; margin: 12px 0 14px; }
+.permission-chip { padding: 5px 9px; color: #c4b6ff; font-family: var(--mono); font-size: 10px; background: #1e1936; border: 1px solid #3c3266; border-radius: 6px; }
+.flag-details strong em { color: var(--cyan); font-style: normal; font-weight: 500; }
+@media (max-width: 780px) {
+  .settings-grid { grid-template-columns: 1fr; }
+}
