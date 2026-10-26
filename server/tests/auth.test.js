@@ -916,3 +916,158 @@ test("prevent non-admins from changing flag keys when enabled in production whil
   assert.equal(adminKeyRename.status, 200);
   assert.equal(adminKeyRename.body.data.key, "search_v2_prod");
 });
+
+test("connectDB reuses active connections, caches in-flight connection promises, and clears failed promises for retry", async () => {
+  const connectDB = require("../src/config/db");
+
+  // 1. When mongoose.connection.readyState === 1, connectDB reuses the active connection without calling mongoose.connect
+  let connectCalls = 0;
+  const originalConnect = mongoose.connect;
+  mongoose.connect = async (...args) => {
+    connectCalls += 1;
+    return originalConnect.apply(mongoose, args);
+  };
+
+  try {
+    assert.equal(mongoose.connection.readyState, 1);
+    const conn = await connectDB();
+    assert.equal(conn, mongoose.connection);
+    assert.equal(connectCalls, 0);
+  } finally {
+    mongoose.connect = originalConnect;
+  }
+
+  // 2. When disconnected, a failed connection clears the cached promise so a subsequent call can retry and succeed
+  await mongoose.disconnect();
+  connectDB.resetConnectionCache();
+
+  let attempt = 0;
+  mongoose.connect = async (...args) => {
+    attempt += 1;
+    if (attempt === 1) {
+      throw new Error("Simulated transient network error");
+    }
+    return originalConnect.apply(mongoose, args);
+  };
+
+  try {
+    await assert.rejects(
+      () => connectDB(mongoServer.getUri()),
+      /Simulated transient network error/
+    );
+    assert.equal(attempt, 1);
+
+    // Retry succeeds and concurrent warm calls share the same promise
+    const [connA, connB] = await Promise.all([
+      connectDB(mongoServer.getUri()),
+      connectDB(mongoServer.getUri()),
+    ]);
+    assert.equal(attempt, 2);
+    assert.equal(connA, connB);
+    assert.equal(mongoose.connection.readyState, 1);
+  } finally {
+    mongoose.connect = originalConnect;
+  }
+});
+
+test("Vercel serverless handler serves /api/health, login, authenticated routes, and CORS without reconnecting on warm calls", async () => {
+  const http = require("node:http");
+  const serverlessHandler = require("../api/index");
+
+  const admin = await createTestUser({
+    name: "Serverless Admin",
+    email: "serverless-admin@example.com",
+    password: "AdminPassword123!",
+    role: "admin",
+  });
+
+  let connectCalls = 0;
+  const originalConnect = mongoose.connect;
+  mongoose.connect = async (...args) => {
+    connectCalls += 1;
+    return originalConnect.apply(mongoose, args);
+  };
+
+  const prevOrigin = process.env.CLIENT_ORIGIN;
+  process.env.CLIENT_ORIGIN = "https://featureflag-studio.vercel.app/";
+
+  const serverlessServer = http.createServer((req, res) =>
+    serverlessHandler(req, res)
+  );
+  await new Promise((resolve) =>
+    serverlessServer.listen(0, "127.0.0.1", resolve)
+  );
+  const { port } = serverlessServer.address();
+  const serverlessUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    // 1. Health endpoint and CORS header matching (with trailing slash stripped from CLIENT_ORIGIN)
+    const healthRes = await fetch(`${serverlessUrl}/api/health`, {
+      headers: { Origin: "https://featureflag-studio.vercel.app" },
+    });
+    assert.equal(healthRes.status, 200);
+    assert.equal(
+      healthRes.headers.get("access-control-allow-origin"),
+      "https://featureflag-studio.vercel.app"
+    );
+    const healthBody = await healthRes.json();
+    assert.equal(healthBody.success, true);
+    assert.equal(healthBody.database, "connected");
+
+    // Disallowed origin does not receive Access-Control-Allow-Origin
+    const disallowedCorsRes = await fetch(`${serverlessUrl}/api/health`, {
+      headers: { Origin: "https://untrusted-origin.example.com" },
+    });
+    assert.equal(
+      disallowedCorsRes.headers.get("access-control-allow-origin"),
+      null
+    );
+
+    // 2. Login via /api/auth/login
+    const loginRes = await fetch(`${serverlessUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "serverless-admin@example.com",
+        password: admin.password,
+      }),
+    });
+    assert.equal(loginRes.status, 200);
+    const loginBody = await loginRes.json();
+    assert.ok(loginBody.data?.accessToken);
+
+    // 3. Authenticated routes (/api/auth/me, /api/flags, /api/users, /api/audit)
+    const authHeaders = {
+      Authorization: `Bearer ${loginBody.data.accessToken}`,
+      "Content-Type": "application/json",
+    };
+
+    const meRes = await fetch(`${serverlessUrl}/api/auth/me`, {
+      headers: authHeaders,
+    });
+    assert.equal(meRes.status, 200);
+
+    const flagsRes = await fetch(`${serverlessUrl}/api/flags`, {
+      headers: authHeaders,
+    });
+    assert.equal(flagsRes.status, 200);
+
+    const usersRes = await fetch(`${serverlessUrl}/api/users`, {
+      headers: authHeaders,
+    });
+    assert.equal(usersRes.status, 200);
+
+    const auditRes = await fetch(`${serverlessUrl}/api/audit`, {
+      headers: authHeaders,
+    });
+    assert.equal(auditRes.status, 200);
+
+    // Warm invocations reused the active Mongoose connection without reconnecting
+    assert.equal(connectCalls, 0);
+  } finally {
+    mongoose.connect = originalConnect;
+    if (prevOrigin === undefined) delete process.env.CLIENT_ORIGIN;
+    else process.env.CLIENT_ORIGIN = prevOrigin;
+    await new Promise((resolve) => serverlessServer.close(resolve));
+  }
+});

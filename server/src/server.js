@@ -70,19 +70,23 @@ try {
   app.set("trust proxy", false);
 }
 
-const allowedOrigins = (
-  process.env.CLIENT_ORIGIN ||
-  "http://localhost:5173,http://127.0.0.1:5173"
-)
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+function getAllowedOrigins(value = process.env.CLIENT_ORIGIN) {
+  return (value || "http://localhost:5173,http://127.0.0.1:5173")
+    .split(",")
+    .map((origin) => origin.trim().replace(/\/+$/, ""))
+    .filter(Boolean);
+}
 
 app.use(securityHeaders);
 // Bearer tokens only: no cookies are used, so credentials stay disabled.
 app.use(
   cors({
-    origin: allowedOrigins,
+    origin(requestOrigin, callback) {
+      if (!requestOrigin) return callback(null, true);
+      const allowed = getAllowedOrigins();
+      const normalizedOrigin = requestOrigin.trim().replace(/\/+$/, "");
+      return callback(null, allowed.includes(normalizedOrigin));
+    },
     methods: ["GET", "POST", "PATCH", "DELETE"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
@@ -144,4 +148,10 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { app, startServer, resolveTrustProxy, configureTrustProxy };
+module.exports = {
+  app,
+  startServer,
+  resolveTrustProxy,
+  configureTrustProxy,
+  getAllowedOrigins,
+};

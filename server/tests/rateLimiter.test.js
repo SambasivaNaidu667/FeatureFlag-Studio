@@ -10,6 +10,7 @@ const {
   resolveTrustProxy,
   configureTrustProxy,
 } = require("../src/server");
+const serverlessHandler = require("../api/index");
 
 function responseRecorder() {
   const headers = {};
@@ -192,5 +193,42 @@ test("proxy-aware rate limiting ignores X-Forwarded-For by default and uses it o
       headers: { "X-Forwarded-For": "203.0.113.10" },
     });
     assert.equal(clientASecond.status, 429);
+
+    // Client spoofing prepended X-Forwarded-For values behind a 1-hop proxy (like Vercel) cannot bypass rate limit
+    const spoofedFirst = await fetch(url, {
+      headers: { "X-Forwarded-For": "192.0.2.1, 198.51.100.99" },
+    });
+    assert.equal(spoofedFirst.status, 200);
+    const spoofedBody = await spoofedFirst.json();
+    assert.equal(spoofedBody.ip, "198.51.100.99");
+
+    const spoofedSecondWithDifferentFakePrefix = await fetch(url, {
+      headers: { "X-Forwarded-For": "192.0.2.2, 198.51.100.99" },
+    });
+    assert.equal(spoofedSecondWithDifferentFakePrefix.status, 429);
   });
+});
+
+test("resolveServerlessTrustProxy defaults to false locally, 1 on Vercel, and honors explicit TRUST_PROXY", () => {
+  const { resolveServerlessTrustProxy } = serverlessHandler;
+  assert.equal(resolveServerlessTrustProxy({}), false);
+  assert.equal(resolveServerlessTrustProxy({ VERCEL: "1" }), 1);
+  assert.equal(
+    resolveServerlessTrustProxy({ VERCEL: "1", TRUST_PROXY: "false" }),
+    "false"
+  );
+  assert.equal(
+    resolveServerlessTrustProxy({ VERCEL: "1", TRUST_PROXY: "2" }),
+    "2"
+  );
+  assert.equal(
+    resolveTrustProxy(resolveServerlessTrustProxy({ VERCEL: "1" })),
+    1
+  );
+  assert.equal(
+    resolveTrustProxy(
+      resolveServerlessTrustProxy({ VERCEL: "1", TRUST_PROXY: "false" })
+    ),
+    false
+  );
 });
