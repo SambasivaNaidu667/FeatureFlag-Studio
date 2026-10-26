@@ -6,6 +6,7 @@ const {
   createUser,
   updateRole,
   updateStatus,
+  deleteUser,
 } = require("../controllers/userController");
 
 const userRouter = express.Router();
@@ -14,6 +15,7 @@ userRouter.get("/", listUsers);
 userRouter.post("/", createUser);
 userRouter.patch("/:id/role", updateRole);
 userRouter.patch("/:id/status", updateStatus);
+userRouter.delete("/:id", deleteUser);
 
 const auditRouter = express.Router();
 auditRouter.use(requireAuth, requirePermission("audit:read"));

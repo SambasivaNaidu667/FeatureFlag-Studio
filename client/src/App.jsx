@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
+  AlertTriangle,
   ArrowUpRight,
   Check,
   ChevronDown,
@@ -37,6 +38,14 @@ const API_ROOT = (
 const API_URL = `${API_ROOT}/flags`
 const environments = ['development', 'staging', 'production']
 const roles = ['admin', 'developer', 'viewer']
+const validSections = new Set([
+  'dashboard',
+  'flags',
+  'environments',
+  'users',
+  'activity',
+  'settings',
+])
 
 const initialForm = {
   name: '',
@@ -55,22 +64,56 @@ const initialUserForm = {
 }
 
 const environmentMeta = {
-  development: { label: 'Development', short: 'DEV', className: 'dev' },
-  staging: { label: 'Staging', short: 'STG', className: 'staging' },
-  production: { label: 'Production', short: 'PRD', className: 'production' },
+  development: {
+    label: 'Development',
+    short: 'DEV',
+    className: 'dev',
+    description: 'Rapid iteration and feature validation for engineering teams.',
+  },
+  staging: {
+    label: 'Staging',
+    short: 'STG',
+    className: 'staging',
+    description: 'Pre-release verification and QA sign-off before production.',
+  },
+  production: {
+    label: 'Production',
+    short: 'PRD',
+    className: 'production',
+    description: 'Live customer traffic governed by administrator release controls.',
+  },
 }
 
 const roleMeta = {
-  admin: { label: 'Admin', className: 'role-admin', summary: 'Full workspace, production, and user control' },
-  developer: { label: 'Developer', className: 'role-developer', summary: 'Create and manage flags in DEV & STG' },
-  viewer: { label: 'Viewer', className: 'role-viewer', summary: 'Read-only access across environments' },
+  admin: {
+    label: 'Admin',
+    className: 'role-admin',
+    summary: 'Full workspace, production, and user control',
+  },
+  developer: {
+    label: 'Developer',
+    className: 'role-developer',
+    summary: 'Create and manage flags in DEV & STG',
+  },
+  viewer: {
+    label: 'Viewer',
+    className: 'role-viewer',
+    summary: 'Read-only access across environments',
+  },
+}
+
+const sectionTitles = {
+  dashboard: 'Overview',
+  flags: 'Feature flags',
+  environments: 'Environments',
+  users: 'Team & roles',
+  activity: 'Audit activity',
+  settings: 'Account & session',
 }
 
 const API_UNAVAILABLE_MESSAGE =
   'Could not connect to the API. Check that the backend is running.'
 
-// Maps an HTTP error response to a user-facing message so that real server
-// responses (401, 403, 429, 5xx) are never reported as connection failures.
 function describeHttpError(status, result = {}) {
   const serverMessage = typeof result.message === 'string' ? result.message : ''
   if (status === 401) return serverMessage || 'Invalid email or password'
@@ -110,6 +153,14 @@ function getInitials(name, email) {
   return source.slice(0, 2).toUpperCase()
 }
 
+function resolveSectionFromHash(hashValue, canManageUsers, canReadAudit) {
+  const raw = (hashValue || '').replace(/^#/, '').trim().toLowerCase()
+  if (!validSections.has(raw)) return 'dashboard'
+  if (raw === 'users' && !canManageUsers) return 'dashboard'
+  if (raw === 'activity' && !canReadAudit) return 'dashboard'
+  return raw
+}
+
 function App() {
   const [accessToken, setAccessToken] = useState('')
   const [currentUser, setCurrentUser] = useState(null)
@@ -133,8 +184,14 @@ function App() {
   const [editingFlag, setEditingFlag] = useState(null)
   const [form, setForm] = useState(initialForm)
   const [saving, setSaving] = useState(false)
+  const [flagBusyId, setFlagBusyId] = useState('')
   const [actionError, setActionError] = useState('')
   const [notice, setNotice] = useState('')
+
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false)
+  const [profileLoading, setProfileLoading] = useState(false)
+  const [profileError, setProfileError] = useState('')
+  const profileWrapperRef = useRef(null)
 
   const [users, setUsers] = useState([])
   const [usersLoading, setUsersLoading] = useState(false)
@@ -143,6 +200,10 @@ function App() {
   const [userForm, setUserForm] = useState(initialUserForm)
   const [userSaving, setUserSaving] = useState(false)
   const [userActionError, setUserActionError] = useState('')
+  const [userBusyId, setUserBusyId] = useState('')
+  const [deletingUser, setDeletingUser] = useState(null)
+  const [userDeleting, setUserDeleting] = useState(false)
+  const [deleteUserError, setDeleteUserError] = useState('')
 
   const [auditEvents, setAuditEvents] = useState([])
   const [auditLoading, setAuditLoading] = useState(false)
@@ -157,12 +218,20 @@ function App() {
     [permissions],
   )
 
-  const canModifyCurrentEnvironment = useMemo(() => {
-    if (environment === 'production') {
-      return permissions.has('flags:production')
-    }
-    return permissions.has('flags:update') || permissions.has('flags:toggle')
-  }, [environment, permissions])
+  const canModifyEnv = useCallback(
+    (envName) => {
+      if (envName === 'production') {
+        return permissions.has('flags:production')
+      }
+      return permissions.has('flags:update') || permissions.has('flags:toggle')
+    },
+    [permissions],
+  )
+
+  const canModifyCurrentEnvironment = useMemo(
+    () => canModifyEnv(environment),
+    [canModifyEnv, environment],
+  )
 
   const canCreateFlag = permissions.has('flags:create')
   const canEditInEnv =
@@ -174,6 +243,62 @@ function App() {
   const canDeleteFlag = permissions.has('flags:delete')
   const canManageUsers = permissions.has('users:manage')
   const canReadAudit = permissions.has('audit:read')
+
+  const navigateTo = useCallback(
+    (section) => {
+      const target = resolveSectionFromHash(section, canManageUsers, canReadAudit)
+      setActiveSection(target)
+      setMobileNavOpen(false)
+      setProfileMenuOpen(false)
+      const expectedHash = `#${target}`
+      if (window.location.hash !== expectedHash) {
+        window.history.pushState(null, '', expectedHash)
+      }
+    },
+    [canManageUsers, canReadAudit],
+  )
+
+  useEffect(() => {
+    if (!accessToken) return
+    const syncFromHash = () => {
+      const next = resolveSectionFromHash(
+        window.location.hash,
+        canManageUsers,
+        canReadAudit,
+      )
+      setActiveSection(next)
+    }
+    syncFromHash()
+    window.addEventListener('hashchange', syncFromHash)
+    window.addEventListener('popstate', syncFromHash)
+    return () => {
+      window.removeEventListener('hashchange', syncFromHash)
+      window.removeEventListener('popstate', syncFromHash)
+    }
+  }, [accessToken, canManageUsers, canReadAudit])
+
+  useEffect(() => {
+    if (!profileMenuOpen) return
+    function handlePointerDown(event) {
+      if (
+        profileWrapperRef.current &&
+        !profileWrapperRef.current.contains(event.target)
+      ) {
+        setProfileMenuOpen(false)
+      }
+    }
+    function handleKeyDown(event) {
+      if (event.key === 'Escape') {
+        setProfileMenuOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [profileMenuOpen])
 
   useEffect(() => {
     let active = true
@@ -187,6 +312,21 @@ function App() {
       .catch(() => {})
     return () => {
       active = false
+    }
+  }, [])
+
+  const clearSessionState = useCallback((expiredMessage = '') => {
+    setAccessToken('')
+    setCurrentUser(null)
+    setFlags([])
+    setUsers([])
+    setAuditEvents([])
+    setProfileMenuOpen(false)
+    setModalOpen(false)
+    setUserModalOpen(false)
+    setDeletingUser(null)
+    if (expiredMessage) {
+      setLoginError(expiredMessage)
     }
   }, [])
 
@@ -208,24 +348,35 @@ function App() {
 
       if (!response.ok) {
         if (response.status === 401 && accessToken) {
-          setLoginError(
+          clearSessionState(
             result.message === 'This account has been deactivated'
               ? 'Your account has been deactivated by an administrator.'
               : 'Your session expired. Please sign in again.',
           )
-          setAccessToken('')
-          setCurrentUser(null)
-          setFlags([])
-          setUsers([])
-          setAuditEvents([])
         }
         throw new Error(describeHttpError(response.status, result))
       }
 
       return result
     },
-    [accessToken],
+    [accessToken, clearSessionState],
   )
+
+  const loadProfile = useCallback(async () => {
+    if (!accessToken) return
+    setProfileLoading(true)
+    setProfileError('')
+    try {
+      const result = await request(`${API_ROOT}/auth/me`)
+      if (result.data) {
+        setCurrentUser(result.data)
+      }
+    } catch (requestError) {
+      setProfileError(requestError.message || 'Could not load account profile.')
+    } finally {
+      setProfileLoading(false)
+    }
+  }, [accessToken, request])
 
   const loadFlags = useCallback(async () => {
     setLoading(true)
@@ -278,7 +429,16 @@ function App() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (accessToken && activeSection === 'users' && canManageUsers) loadUsers()
     if (accessToken && activeSection === 'activity' && canReadAudit) loadAudit()
-  }, [accessToken, activeSection, canManageUsers, canReadAudit, loadUsers, loadAudit])
+    if (accessToken && activeSection === 'settings') loadProfile()
+  }, [
+    accessToken,
+    activeSection,
+    canManageUsers,
+    canReadAudit,
+    loadUsers,
+    loadAudit,
+    loadProfile,
+  ])
 
   async function handleLogin(event) {
     event.preventDefault()
@@ -330,9 +490,17 @@ function App() {
       if (typeof result.data?.accessToken !== 'string' || !result.data.accessToken) {
         throw new Error('The server returned an invalid sign-in response')
       }
+      const userObj = result.data.user || null
+      const userPerms = new Set(userObj?.permissions || [])
+      const initialSection = resolveSectionFromHash(
+        window.location.hash,
+        userPerms.has('users:manage'),
+        userPerms.has('audit:read'),
+      )
       setAccessToken(result.data.accessToken)
-      setCurrentUser(result.data.user || null)
-      setActiveSection('dashboard')
+      setCurrentUser(userObj)
+      setActiveSection(initialSection)
+      window.history.replaceState(null, '', `#${initialSection}`)
       setCredentials({ name: '', email: '', password: '' })
     } catch (requestError) {
       setLoginError(requestError.message || 'Sign-in failed')
@@ -343,12 +511,7 @@ function App() {
 
   async function logout() {
     const tokenToRevoke = accessToken
-    setAccessToken('')
-    setCurrentUser(null)
-    setFlags([])
-    setUsers([])
-    setAuditEvents([])
-    setLoginError('')
+    clearSessionState('')
     setLoginNotice('')
     setNotice('')
     setError('')
@@ -357,6 +520,14 @@ function App() {
         method: 'POST',
         headers: { Authorization: `Bearer ${tokenToRevoke}` },
       }).catch(() => {})
+    }
+  }
+
+  function handleToggleProfileMenu() {
+    const nextOpen = !profileMenuOpen
+    setProfileMenuOpen(nextOpen)
+    if (nextOpen) {
+      loadProfile()
     }
   }
 
@@ -376,6 +547,44 @@ function App() {
       return matchesSearch && matchesStatus
     })
   }, [flags, search, environment, statusFilter])
+
+  const environmentSummaries = useMemo(() => {
+    return environments.map((envKey) => {
+      const meta = environmentMeta[envKey]
+      let enabled = 0
+      let rolloutSum = 0
+      let targeted = 0
+      for (const flag of flags) {
+        const cfg = flag.environments?.[envKey] || {}
+        if (cfg.enabled) enabled += 1
+        rolloutSum += cfg.rolloutPercentage || 0
+        if ((cfg.allowlist?.length || 0) > 0 || (cfg.denylist?.length || 0) > 0) {
+          targeted += 1
+        }
+      }
+      const total = flags.length
+      return {
+        key: envKey,
+        ...meta,
+        total,
+        enabled,
+        disabled: Math.max(0, total - enabled),
+        averageRollout: total ? Math.round(rolloutSum / total) : 0,
+        targeted,
+        editable: canModifyEnv(envKey),
+      }
+    })
+  }, [flags, canModifyEnv])
+
+  const recentFlags = useMemo(() => {
+    return [...flags]
+      .sort(
+        (a, b) =>
+          new Date(b.updatedAt || b.createdAt || 0).getTime() -
+          new Date(a.updatedAt || a.createdAt || 0).getTime(),
+      )
+      .slice(0, 5)
+  }, [flags])
 
   const enabledCount = flags.filter(
     (flag) => flag.environments?.[environment]?.enabled,
@@ -397,9 +606,15 @@ function App() {
     setModalOpen(true)
   }
 
-  function openEditModal(flag) {
-    if (!canEditInEnv) return
-    const config = flag.environments?.[environment] || {}
+  function openEditModal(flag, targetEnv = environment) {
+    const canEditTarget =
+      permissions.has('flags:update') &&
+      (targetEnv !== 'production' || permissions.has('flags:production'))
+    if (!canEditTarget) return
+    if (targetEnv !== environment) {
+      setEnvironment(targetEnv)
+    }
+    const config = flag.environments?.[targetEnv] || {}
     setEditingFlag(flag)
     setForm({
       name: flag.name,
@@ -422,6 +637,7 @@ function App() {
 
   async function handleSubmit(event) {
     event.preventDefault()
+    if (saving) return
     setSaving(true)
     setActionError('')
     setNotice('')
@@ -485,18 +701,25 @@ function App() {
       setActionError('')
     } catch (requestError) {
       setActionError(requestError.message)
+      if (requestError.message?.includes('permission')) {
+        loadProfile()
+      }
     } finally {
       setSaving(false)
     }
   }
 
-  async function toggleFlag(flag) {
-    if (!canToggleInEnv) return
+  async function toggleFlag(flag, targetEnv = environment) {
+    const allowed =
+      permissions.has('flags:toggle') &&
+      (targetEnv !== 'production' || permissions.has('flags:production'))
+    if (!allowed || flagBusyId === flag._id) return
+    setFlagBusyId(flag._id)
     setNotice('')
     setError('')
     try {
       const result = await request(
-        `${API_URL}/${flag._id}/environments/${environment}/toggle`,
+        `${API_URL}/${flag._id}/environments/${targetEnv}/toggle`,
         { method: 'PATCH' },
       )
       setFlags((current) =>
@@ -505,16 +728,22 @@ function App() {
       setNotice(
         `${result.data.name} is now ${
           result.configuration.enabled ? 'enabled' : 'disabled'
-        } in ${environment}.`,
+        } in ${targetEnv}.`,
       )
     } catch (requestError) {
       setError(requestError.message)
+      if (requestError.message?.includes('permission')) {
+        loadProfile()
+      }
+    } finally {
+      setFlagBusyId('')
     }
   }
 
   async function deleteFlag(flag) {
-    if (!canDeleteFlag) return
+    if (!canDeleteFlag || flagBusyId === flag._id) return
     if (!window.confirm(`Delete "${flag.name}"? This action cannot be undone.`)) return
+    setFlagBusyId(flag._id)
     setNotice('')
     setError('')
     try {
@@ -523,6 +752,8 @@ function App() {
       setNotice(`${flag.name} was deleted.`)
     } catch (requestError) {
       setError(requestError.message)
+    } finally {
+      setFlagBusyId('')
     }
   }
 
@@ -532,6 +763,7 @@ function App() {
 
   async function handleCreateUser(event) {
     event.preventDefault()
+    if (userSaving) return
     setUserSaving(true)
     setUserActionError('')
     setNotice('')
@@ -552,7 +784,8 @@ function App() {
   }
 
   async function handleRoleChange(targetUser, nextRole) {
-    if (targetUser.role === nextRole) return
+    if (targetUser.role === nextRole || userBusyId === targetUser._id) return
+    setUserBusyId(targetUser._id)
     setUsersError('')
     setNotice('')
     try {
@@ -566,10 +799,13 @@ function App() {
       setNotice(`Updated ${targetUser.email} role to ${nextRole}.`)
     } catch (requestError) {
       setUsersError(requestError.message)
+    } finally {
+      setUserBusyId('')
     }
   }
 
   async function handleStatusToggle(targetUser) {
+    if (userBusyId === targetUser._id) return
     const nextStatus = targetUser.status === 'active' ? 'deactivated' : 'active'
     if (
       nextStatus === 'deactivated' &&
@@ -579,6 +815,7 @@ function App() {
     ) {
       return
     }
+    setUserBusyId(targetUser._id)
     setUsersError('')
     setNotice('')
     try {
@@ -594,6 +831,42 @@ function App() {
       )
     } catch (requestError) {
       setUsersError(requestError.message)
+    } finally {
+      setUserBusyId('')
+    }
+  }
+
+  function openDeleteUserModal(targetUser) {
+    if (targetUser.status !== 'deactivated' || userBusyId === targetUser._id) return
+    setDeleteUserError('')
+    setDeletingUser(targetUser)
+  }
+
+  function closeDeleteUserModal() {
+    if (userDeleting) return
+    setDeletingUser(null)
+    setDeleteUserError('')
+  }
+
+  async function confirmDeleteUser() {
+    if (!deletingUser || userDeleting) return
+    setUserDeleting(true)
+    setDeleteUserError('')
+    setUsersError('')
+    setNotice('')
+    try {
+      await request(`${API_ROOT}/users/${deletingUser._id}`, {
+        method: 'DELETE',
+      })
+      const removedEmail = deletingUser.email
+      const removedId = deletingUser._id
+      setUsers((current) => current.filter((item) => item._id !== removedId))
+      setDeletingUser(null)
+      setNotice(`Permanently deleted deactivated account ${removedEmail}.`)
+    } catch (requestError) {
+      setDeleteUserError(requestError.message)
+    } finally {
+      setUserDeleting(false)
     }
   }
 
@@ -614,8 +887,6 @@ function App() {
             </p>
           </div>
           <div className="signal-map" aria-hidden="true">
-            {/* Uniform scaling keeps circles round. Nodes sit 60 units apart (r=24) so they never
-                overlap, and each line runs from the origin's edge to the edge of its target circle. */}
             <svg className="signal-graphic" viewBox="0 0 580 185" preserveAspectRatio="xMinYMid meet">
               <defs>
                 <linearGradient id="signal-line-gradient" gradientUnits="userSpaceOnUse" x1="58" y1="0" x2="248" y2="0">
@@ -783,8 +1054,7 @@ function App() {
             href="#dashboard"
             onClick={(event) => {
               event.preventDefault()
-              setActiveSection('dashboard')
-              setMobileNavOpen(false)
+              navigateTo('dashboard')
             }}
             aria-label="FeatureFlag Studio home"
           >
@@ -800,23 +1070,28 @@ function App() {
             <X size={19} />
           </button>
         </div>
-        <div className="workspace-switcher">
+        <button
+          className="workspace-switcher"
+          type="button"
+          onClick={() => navigateTo('environments')}
+          title="View workspace environments"
+        >
           <span className="workspace-avatar">F</span>
           <span>
             <strong>FeatureFlag Studio</strong>
-            <small>{currentRoleMeta.label} access</small>
+            <small>{currentRoleMeta.label} · {currentEnvironment.short} scope</small>
           </span>
           <ChevronDown size={15} />
-        </div>
+        </button>
         <p className="nav-label">WORKSPACE</p>
         <nav className="sidebar-nav" aria-label="Main navigation">
           <a
             className={`nav-item ${activeSection === 'dashboard' ? 'active' : ''}`}
             href="#dashboard"
+            aria-current={activeSection === 'dashboard' ? 'page' : undefined}
             onClick={(event) => {
               event.preventDefault()
-              setActiveSection('dashboard')
-              setMobileNavOpen(false)
+              navigateTo('dashboard')
             }}
           >
             <LayoutDashboard size={17} />
@@ -825,10 +1100,10 @@ function App() {
           <a
             className={`nav-item ${activeSection === 'flags' ? 'active' : ''}`}
             href="#flags"
+            aria-current={activeSection === 'flags' ? 'page' : undefined}
             onClick={(event) => {
               event.preventDefault()
-              setActiveSection('flags')
-              setMobileNavOpen(false)
+              navigateTo('flags')
             }}
           >
             <ToggleLeft size={17} />
@@ -838,14 +1113,15 @@ function App() {
           <a
             className={`nav-item ${activeSection === 'environments' ? 'active' : ''}`}
             href="#environments"
+            aria-current={activeSection === 'environments' ? 'page' : undefined}
             onClick={(event) => {
               event.preventDefault()
-              setActiveSection('environments')
-              setMobileNavOpen(false)
+              navigateTo('environments')
             }}
           >
             <FlaskConical size={17} />
             <span>Environments</span>
+            <b>{environments.length}</b>
           </a>
         </nav>
         <p className="nav-label nav-label-spaced">GOVERNANCE</p>
@@ -854,10 +1130,10 @@ function App() {
             <a
               className={`nav-item ${activeSection === 'users' ? 'active' : ''}`}
               href="#users"
+              aria-current={activeSection === 'users' ? 'page' : undefined}
               onClick={(event) => {
                 event.preventDefault()
-                setActiveSection('users')
-                setMobileNavOpen(false)
+                navigateTo('users')
               }}
             >
               <Users size={17} />
@@ -869,10 +1145,10 @@ function App() {
             <a
               className={`nav-item ${activeSection === 'activity' ? 'active' : ''}`}
               href="#activity"
+              aria-current={activeSection === 'activity' ? 'page' : undefined}
               onClick={(event) => {
                 event.preventDefault()
-                setActiveSection('activity')
-                setMobileNavOpen(false)
+                navigateTo('activity')
               }}
             >
               <Activity size={17} />
@@ -882,10 +1158,10 @@ function App() {
           <a
             className={`nav-item ${activeSection === 'settings' ? 'active' : ''}`}
             href="#settings"
+            aria-current={activeSection === 'settings' ? 'page' : undefined}
             onClick={(event) => {
               event.preventDefault()
-              setActiveSection('settings')
-              setMobileNavOpen(false)
+              navigateTo('settings')
             }}
           >
             <Settings size={17} />
@@ -900,11 +1176,18 @@ function App() {
             <div className="upgrade-line"><span /></div>
           </div>
           <div className="profile">
-            <span className="profile-avatar">{userInitials}</span>
-            <span className="profile-info">
-              <strong>{currentUser?.name || 'Workspace User'}</strong>
-              <small>{currentUser?.email}</small>
-            </span>
+            <button
+              type="button"
+              className="profile-identity-button"
+              onClick={() => navigateTo('settings')}
+              title="Open account & session details"
+            >
+              <span className="profile-avatar">{userInitials}</span>
+              <span className="profile-info">
+                <strong>{currentUser?.name || 'Workspace User'}</strong>
+                <small>{currentUser?.email || 'Authenticated session'}</small>
+              </span>
+            </button>
             <button type="button" onClick={logout} aria-label="Sign out" title="Sign out">
               <LogOut size={16} />
             </button>
@@ -921,7 +1204,7 @@ function App() {
         />
       )}
 
-      <main className="main-content" id="dashboard">
+      <main className="main-content" id="main-view">
         <header className="topbar">
           <button
             className="mobile-menu"
@@ -934,17 +1217,7 @@ function App() {
           <div className="breadcrumbs">
             <span>Workspace</span>
             <i>/</i>
-            <strong>
-              {activeSection === 'users'
-                ? 'Team & roles'
-                : activeSection === 'activity'
-                  ? 'Audit activity'
-                  : activeSection === 'settings'
-                    ? 'Account & session'
-                    : activeSection === 'environments'
-                      ? 'Environments'
-                      : 'Overview'}
-            </strong>
+            <strong>{sectionTitles[activeSection] || 'Overview'}</strong>
           </div>
           <div className="topbar-actions">
             <span className={`role-badge ${currentRoleMeta.className}`}>
@@ -953,8 +1226,90 @@ function App() {
             <span className="connection-status">
               <span className="live-dot" /> API connected
             </span>
-            <div className="topbar-avatar" title={currentUser?.email}>
-              {userInitials}
+            <div className="profile-menu-anchor" ref={profileWrapperRef}>
+              <button
+                type="button"
+                className={`topbar-avatar topbar-avatar-button ${
+                  profileMenuOpen ? 'is-open' : ''
+                }`}
+                onClick={handleToggleProfileMenu}
+                aria-label="Open user profile menu"
+                aria-haspopup="dialog"
+                aria-expanded={profileMenuOpen}
+                title={currentUser?.email || 'Account profile'}
+              >
+                {userInitials}
+              </button>
+              {profileMenuOpen && (
+                <div
+                  className="profile-popover"
+                  role="dialog"
+                  aria-label="Signed-in user profile"
+                >
+                  <div className="profile-popover-head">
+                    <span className="profile-avatar">{userInitials}</span>
+                    <div className="profile-popover-identity">
+                      <strong>{currentUser?.name || 'Workspace User'}</strong>
+                      <code>{currentUser?.email || '—'}</code>
+                    </div>
+                  </div>
+                  <div className="profile-popover-badges">
+                    <span className={`role-badge ${currentRoleMeta.className}`}>
+                      {currentRoleMeta.label}
+                    </span>
+                    <span className="status-pill status-active">
+                      <span />
+                      {currentUser?.status === 'deactivated' ? 'Deactivated' : 'Active'}
+                    </span>
+                  </div>
+                  {profileLoading && (
+                    <p className="profile-popover-note">
+                      <LoaderCircle className="spin" size={13} /> Syncing profile...
+                    </p>
+                  )}
+                  {profileError && (
+                    <div className="profile-popover-error" role="alert">
+                      <span>{profileError}</span>
+                      <button type="button" onClick={loadProfile}>
+                        Retry
+                      </button>
+                    </div>
+                  )}
+                  <div className="profile-popover-section">
+                    <span className="section-eyebrow">GRANTED PERMISSIONS</span>
+                    <div className="permission-list compact">
+                      {(currentUser?.permissions || []).length > 0 ? (
+                        currentUser.permissions.map((perm) => (
+                          <code key={perm} className="permission-chip">
+                            {perm}
+                          </code>
+                        ))
+                      ) : (
+                        <small>No explicit permissions loaded</small>
+                      )}
+                    </div>
+                  </div>
+                  <p className="profile-popover-meta">
+                    15-minute JWT held in memory · Cleared on page refresh
+                  </p>
+                  <div className="profile-popover-actions">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => navigateTo('settings')}
+                    >
+                      <Settings size={14} /> Account & session
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button danger-outline-button"
+                      onClick={logout}
+                    >
+                      <LogOut size={14} /> Sign out
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </header>
@@ -964,26 +1319,24 @@ function App() {
             <div className="notice success-notice" role="status">
               <Check size={16} />
               <span>{notice}</span>
-              <button onClick={() => setNotice('')} aria-label="Dismiss message">
+              <button type="button" onClick={() => setNotice('')} aria-label="Dismiss message">
                 <X size={15} />
               </button>
             </div>
           )}
 
-          {(activeSection === 'dashboard' ||
-            activeSection === 'flags' ||
-            activeSection === 'environments') && (
+          {activeSection === 'dashboard' && (
             <>
               <section className="hero-row">
                 <div>
                   <p className="kicker">
-                    <span className="kicker-mark" /> FEATURE MANAGEMENT
+                    <span className="kicker-mark" /> WORKSPACE OVERVIEW
                   </p>
                   <h1>
-                    Feature flags<span className="heading-period">.</span>
+                    Release command center<span className="heading-period">.</span>
                   </h1>
                   <p className="page-subtitle">
-                    A precise control plane for shipping what matters.
+                    Real-time posture across environments, rollout exposure, and recent flag activity.
                   </p>
                 </div>
                 <div className="hero-actions">
@@ -1002,29 +1355,25 @@ function App() {
                     </select>
                     <ChevronDown size={15} />
                   </label>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => navigateTo('flags')}
+                  >
+                    <ToggleLeft size={16} /> View inventory
+                  </button>
                   {canCreateFlag && (
-                    <button className="primary-button" onClick={openCreateModal}>
+                    <button type="button" className="primary-button" onClick={openCreateModal}>
                       <Plus size={17} /> New flag
                     </button>
                   )}
                 </div>
               </section>
 
-              {!canModifyCurrentEnvironment && (
-                <div className="notice info-notice" role="status">
-                  <Lock size={15} />
-                  <span>
-                    {currentUser?.role === 'viewer'
-                      ? 'You have Viewer access. Feature flags and targeting configurations are read-only.'
-                      : 'Production configuration is protected. Only administrators can toggle or modify production targeting.'}
-                  </span>
-                </div>
-              )}
-
               {error && (
                 <div className="notice error-notice" role="alert">
                   <span>{error}</span>
-                  <button onClick={loadFlags} className="retry-button">
+                  <button type="button" onClick={loadFlags} className="retry-button">
                     Retry <RefreshCw size={13} />
                   </button>
                 </div>
@@ -1066,7 +1415,7 @@ function App() {
                     {averageRollout}
                     <em>%</em>
                   </strong>
-                  <small>Current environment</small>
+                  <small>In {currentEnvironment.label}</small>
                 </article>
                 <article className="metric-card metric-context">
                   <div className="metric-label">
@@ -1079,6 +1428,239 @@ function App() {
                   </small>
                 </article>
               </section>
+
+              <section className="overview-grid">
+                <div className="flags-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <div className="section-eyebrow">
+                        RECENT ACTIVITY <span />
+                      </div>
+                      <div className="panel-title-row">
+                        <h2>Recently updated flags</h2>
+                        <span className="total-pill">
+                          {recentFlags.length.toString().padStart(2, '0')}
+                        </span>
+                      </div>
+                      <p>
+                        Showing state in {currentEnvironment.label}. Open Feature flags for full search and filtering.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => navigateTo('flags')}
+                    >
+                      Open full inventory <ArrowUpRight size={14} />
+                    </button>
+                  </div>
+                  <div className="table-wrap">
+                    <table className="flags-table">
+                      <thead>
+                        <tr>
+                          <th>FLAG</th>
+                          <th>{currentEnvironment.short} STATE</th>
+                          <th>ROLLOUT</th>
+                          <th>UPDATED</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {loading ? (
+                          <tr>
+                            <td colSpan="4" className="table-message">
+                              <LoaderCircle className="spin" size={22} />
+                              <span>Loading workspace overview...</span>
+                            </td>
+                          </tr>
+                        ) : recentFlags.length === 0 ? (
+                          <tr>
+                            <td colSpan="4" className="table-message empty-state">
+                              <span className="empty-icon">
+                                <Code2 size={21} />
+                              </span>
+                              <strong>No feature flags yet</strong>
+                              <span>
+                                {canCreateFlag
+                                  ? 'Create your first feature flag to begin orchestrating releases.'
+                                  : 'No feature flags have been configured in this workspace.'}
+                              </span>
+                              {canCreateFlag && (
+                                <button
+                                  type="button"
+                                  className="primary-button small-primary"
+                                  onClick={openCreateModal}
+                                >
+                                  <Plus size={15} /> Create first flag
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ) : (
+                          recentFlags.map((flag) => {
+                            const cfg = flag.environments?.[environment] || {}
+                            return (
+                              <tr key={flag._id}>
+                                <td>
+                                  <div className="flag-name-cell">
+                                    <div
+                                      className={`flag-symbol ${
+                                        cfg.enabled ? 'symbol-on' : ''
+                                      }`}
+                                    >
+                                      <Code2 size={17} />
+                                    </div>
+                                    <div className="flag-details">
+                                      <strong>{flag.name}</strong>
+                                      <code>{flag.key}</code>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td>
+                                  <span
+                                    className={`status-pill ${
+                                      cfg.enabled ? 'status-active' : 'status-deactivated'
+                                    }`}
+                                  >
+                                    <span />
+                                    {cfg.enabled ? 'Enabled' : 'Disabled'}
+                                  </span>
+                                </td>
+                                <td>
+                                  <span className="date-cell">
+                                    {cfg.rolloutPercentage || 0}%
+                                  </span>
+                                </td>
+                                <td>
+                                  <span className="date-cell">
+                                    {formatDate(flag.updatedAt || flag.createdAt)}
+                                  </span>
+                                </td>
+                              </tr>
+                            )
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                <div className="flags-panel overview-side-panel">
+                  <div className="panel-heading">
+                    <div>
+                      <div className="section-eyebrow">
+                        ENVIRONMENT POSTURE <span />
+                      </div>
+                      <div className="panel-title-row">
+                        <h2>Release channels</h2>
+                      </div>
+                      <p>Live rollout summary across all three environments.</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      onClick={() => navigateTo('environments')}
+                    >
+                      Environments <ArrowUpRight size={14} />
+                    </button>
+                  </div>
+                  <div className="env-mini-list">
+                    {environmentSummaries.map((envStat) => (
+                      <div
+                        key={envStat.key}
+                        className={`env-mini-card ${
+                          environment === envStat.key ? 'is-selected' : ''
+                        }`}
+                      >
+                        <div className="env-mini-top">
+                          <span className={`environment-tag ${envStat.className}`}>
+                            <span />
+                            {envStat.label}
+                          </span>
+                          <span className="env-access-pill">
+                            {envStat.editable ? 'Editable' : 'Read-only'}
+                          </span>
+                        </div>
+                        <div className="env-mini-stats">
+                          <div>
+                            <strong>
+                              {envStat.enabled} / {envStat.total}
+                            </strong>
+                            <small>Enabled flags</small>
+                          </div>
+                          <div>
+                            <strong>{envStat.averageRollout}%</strong>
+                            <small>Avg rollout</small>
+                          </div>
+                          <div>
+                            <strong>{envStat.targeted}</strong>
+                            <small>Targeted</small>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </section>
+            </>
+          )}
+
+          {activeSection === 'flags' && (
+            <>
+              <section className="hero-row">
+                <div>
+                  <p className="kicker">
+                    <span className="kicker-mark" /> FEATURE INVENTORY
+                  </p>
+                  <h1>
+                    Feature flags<span className="heading-period">.</span>
+                  </h1>
+                  <p className="page-subtitle">
+                    Search, filter, and orchestrate feature rollouts and user targeting rules.
+                  </p>
+                </div>
+                <div className="hero-actions">
+                  <label className="environment-picker">
+                    <span>VIEWING ENVIRONMENT</span>
+                    <select
+                      value={environment}
+                      onChange={(event) => setEnvironment(event.target.value)}
+                      aria-label="Viewing environment"
+                    >
+                      {environments.map((item) => (
+                        <option value={item} key={item}>
+                          {environmentMeta[item].label}
+                        </option>
+                      ))}
+                    </select>
+                    <ChevronDown size={15} />
+                  </label>
+                  {canCreateFlag && (
+                    <button type="button" className="primary-button" onClick={openCreateModal}>
+                      <Plus size={17} /> New flag
+                    </button>
+                  )}
+                </div>
+              </section>
+
+              {!canModifyCurrentEnvironment && (
+                <div className="notice info-notice" role="status">
+                  <Lock size={15} />
+                  <span>
+                    {currentUser?.role === 'viewer'
+                      ? 'You have Viewer access. Feature flags and targeting configurations are read-only.'
+                      : 'Production configuration is protected. Only administrators can toggle or modify production targeting.'}
+                  </span>
+                </div>
+              )}
+
+              {error && (
+                <div className="notice error-notice" role="alert">
+                  <span>{error}</span>
+                  <button type="button" onClick={loadFlags} className="retry-button">
+                    Retry <RefreshCw size={13} />
+                  </button>
+                </div>
+              )}
 
               <section className="flags-panel" id="flags">
                 <div className="panel-heading">
@@ -1095,6 +1677,7 @@ function App() {
                     <p>Manage release states and audience targeting from one place.</p>
                   </div>
                   <button
+                    type="button"
                     className="secondary-button"
                     onClick={loadFlags}
                     disabled={loading}
@@ -1187,6 +1770,7 @@ function App() {
                             </span>
                             {!flags.length && canCreateFlag && (
                               <button
+                                type="button"
                                 className="primary-button small-primary"
                                 onClick={openCreateModal}
                               >
@@ -1198,6 +1782,7 @@ function App() {
                       ) : (
                         filteredFlags.map((flag) => {
                           const config = flag.environments?.[environment] || {}
+                          const isBusy = flagBusyId === flag._id
                           return (
                             <tr key={flag._id}>
                               <td>
@@ -1232,7 +1817,7 @@ function App() {
                                     }`}
                                     type="button"
                                     role="switch"
-                                    disabled={!canToggleInEnv}
+                                    disabled={!canToggleInEnv || isBusy}
                                     aria-checked={Boolean(config.enabled)}
                                     aria-label={`${
                                       config.enabled ? 'Disable' : 'Enable'
@@ -1267,6 +1852,7 @@ function App() {
                                     <button
                                       className="row-action"
                                       type="button"
+                                      disabled={isBusy}
                                       onClick={() => openEditModal(flag)}
                                       aria-label={`Edit ${flag.name}`}
                                       title="Edit flag"
@@ -1278,6 +1864,7 @@ function App() {
                                     <button
                                       className="row-action delete-action"
                                       type="button"
+                                      disabled={isBusy}
                                       onClick={() => deleteFlag(flag)}
                                       aria-label={`Delete ${flag.name}`}
                                       title="Delete flag"
@@ -1307,6 +1894,200 @@ function App() {
             </>
           )}
 
+          {activeSection === 'environments' && (
+            <>
+              <section className="hero-row">
+                <div>
+                  <p className="kicker">
+                    <span className="kicker-mark" /> ENVIRONMENT TOPOLOGY
+                  </p>
+                  <h1>
+                    Release environments<span className="heading-period">.</span>
+                  </h1>
+                  <p className="page-subtitle">
+                    Compare rollout posture across Development, Staging, and Production and manage per-environment targeting.
+                  </p>
+                </div>
+                <div className="hero-actions">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={loadFlags}
+                    disabled={loading}
+                  >
+                    {loading ? (
+                      <LoaderCircle className="spin" size={15} />
+                    ) : (
+                      <RefreshCw size={15} />
+                    )}{' '}
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={() => navigateTo('flags')}
+                  >
+                    <ToggleLeft size={16} /> Open inventory
+                  </button>
+                </div>
+              </section>
+
+              {currentUser?.role !== 'admin' && (
+                <div className="notice info-notice" role="status">
+                  <Lock size={15} />
+                  <span>
+                    {currentUser?.role === 'viewer'
+                      ? 'Viewer access is read-only across Development, Staging, and Production.'
+                      : 'Developer access permits changes in Development and Staging. Production is read-only and requires an Administrator.'}
+                  </span>
+                </div>
+              )}
+
+              {error && (
+                <div className="notice error-notice" role="alert">
+                  <span>{error}</span>
+                  <button type="button" onClick={loadFlags} className="retry-button">
+                    Retry <RefreshCw size={13} />
+                  </button>
+                </div>
+              )}
+
+              <section className="environments-grid" aria-label="Environment cards">
+                {environmentSummaries.map((envStat) => {
+                  const isSelected = environment === envStat.key
+                  const canToggleThisEnv =
+                    permissions.has('flags:toggle') &&
+                    (envStat.key !== 'production' || permissions.has('flags:production'))
+                  const canEditThisEnv =
+                    permissions.has('flags:update') &&
+                    (envStat.key !== 'production' || permissions.has('flags:production'))
+
+                  return (
+                    <article
+                      key={envStat.key}
+                      className={`flags-panel environment-card ${
+                        isSelected ? 'selected-env-card' : ''
+                      }`}
+                    >
+                      <div className="environment-card-head">
+                        <div>
+                          <div className="environment-card-badges">
+                            <span className={`environment-tag ${envStat.className}`}>
+                              <span />
+                              {envStat.label} ({envStat.short})
+                            </span>
+                            <span className="env-access-pill">
+                              {envStat.editable
+                                ? 'Editable'
+                                : envStat.key === 'production' &&
+                                    currentUser?.role === 'developer'
+                                  ? 'Read-only · Admin required'
+                                  : 'Read-only'}
+                            </span>
+                          </div>
+                          <p className="environment-card-desc">{envStat.description}</p>
+                        </div>
+                        <button
+                          type="button"
+                          className={isSelected ? 'primary-button small-action-button' : 'secondary-button small-action-button'}
+                          onClick={() => setEnvironment(envStat.key)}
+                        >
+                          {isSelected ? 'Selected scope' : `Select ${envStat.short}`}
+                        </button>
+                      </div>
+
+                      <div className="environment-metrics-row">
+                        <div>
+                          <strong>
+                            {envStat.enabled} <em>/ {envStat.total}</em>
+                          </strong>
+                          <small>Enabled flags</small>
+                        </div>
+                        <div>
+                          <strong>{envStat.disabled}</strong>
+                          <small>Disabled flags</small>
+                        </div>
+                        <div>
+                          <strong>
+                            {envStat.averageRollout}
+                            <em>%</em>
+                          </strong>
+                          <small>Avg rollout</small>
+                        </div>
+                        <div>
+                          <strong>{envStat.targeted}</strong>
+                          <small>With ID lists</small>
+                        </div>
+                      </div>
+
+                      <div className="environment-flag-list">
+                        {loading ? (
+                          <div className="environment-empty">
+                            <LoaderCircle className="spin" size={18} />
+                            <span>Syncing {envStat.label} flags...</span>
+                          </div>
+                        ) : flags.length === 0 ? (
+                          <div className="environment-empty">
+                            <span>No feature flags configured in {envStat.label}.</span>
+                          </div>
+                        ) : (
+                          flags.map((flag) => {
+                            const cfg = flag.environments?.[envStat.key] || {}
+                            const allowCount = cfg.allowlist?.length || 0
+                            const denyCount = cfg.denylist?.length || 0
+                            const isBusy = flagBusyId === flag._id
+                            return (
+                              <div key={flag._id} className="environment-flag-row">
+                                <div className="environment-flag-info">
+                                  <strong>{flag.name}</strong>
+                                  <code>{flag.key}</code>
+                                  <small>
+                                    {cfg.rolloutPercentage || 0}% rollout
+                                    {(allowCount > 0 || denyCount > 0) &&
+                                      ` · ${allowCount} allow / ${denyCount} deny`}
+                                  </small>
+                                </div>
+                                <div className="environment-flag-controls">
+                                  <button
+                                    className={`toggle-switch ${
+                                      cfg.enabled ? 'is-on' : ''
+                                    }`}
+                                    type="button"
+                                    role="switch"
+                                    disabled={!canToggleThisEnv || isBusy}
+                                    aria-checked={Boolean(cfg.enabled)}
+                                    aria-label={`${
+                                      cfg.enabled ? 'Disable' : 'Enable'
+                                    } ${flag.name} in ${envStat.label}`}
+                                    onClick={() => toggleFlag(flag, envStat.key)}
+                                  >
+                                    <span />
+                                  </button>
+                                  {canEditThisEnv && (
+                                    <button
+                                      type="button"
+                                      className="row-action"
+                                      disabled={isBusy}
+                                      onClick={() => openEditModal(flag, envStat.key)}
+                                      aria-label={`Configure ${flag.name} in ${envStat.label}`}
+                                      title={`Configure ${envStat.label} targeting`}
+                                    >
+                                      <Pencil size={14} />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            )
+                          })
+                        )}
+                      </div>
+                    </article>
+                  )
+                })}
+              </section>
+            </>
+          )}
+
           {activeSection === 'users' && canManageUsers && (
             <>
               <section className="hero-row">
@@ -1318,11 +2099,12 @@ function App() {
                     Team & roles<span className="heading-period">.</span>
                   </h1>
                   <p className="page-subtitle">
-                    Manage workspace members, assign role-based permissions, and revoke access.
+                    Manage workspace members, assign role-based permissions, and deactivate or permanently remove deactivated accounts.
                   </p>
                 </div>
                 <div className="hero-actions">
                   <button
+                    type="button"
                     className="primary-button"
                     onClick={() => {
                       setUserForm(initialUserForm)
@@ -1338,7 +2120,7 @@ function App() {
               {usersError && (
                 <div className="notice error-notice" role="alert">
                   <span>{usersError}</span>
-                  <button onClick={loadUsers} className="retry-button">
+                  <button type="button" onClick={loadUsers} className="retry-button">
                     Retry <RefreshCw size={13} />
                   </button>
                 </div>
@@ -1357,10 +2139,11 @@ function App() {
                       </span>
                     </div>
                     <p>
-                      Role changes apply on the next API request. Deactivating a user revokes all active tokens immediately.
+                      Role changes apply on the next API request. Deactivated accounts can be reactivated or permanently deleted.
                     </p>
                   </div>
                   <button
+                    type="button"
                     className="secondary-button"
                     onClick={loadUsers}
                     disabled={usersLoading}
@@ -1403,6 +2186,7 @@ function App() {
                       ) : (
                         users.map((member) => {
                           const isSelf = member._id === currentUser?.id
+                          const isBusy = userBusyId === member._id
                           const memberRole = roleMeta[member.role] || roleMeta.viewer
                           return (
                             <tr key={member._id}>
@@ -1426,7 +2210,7 @@ function App() {
                                   </span>
                                   <select
                                     value={member.role}
-                                    disabled={isSelf}
+                                    disabled={isSelf || isBusy}
                                     aria-label={`Role for ${member.email}`}
                                     onChange={(event) =>
                                       handleRoleChange(member, event.target.value)
@@ -1463,7 +2247,7 @@ function App() {
                                   <button
                                     className="secondary-button small-action-button"
                                     type="button"
-                                    disabled={isSelf}
+                                    disabled={isSelf || isBusy}
                                     onClick={() => handleStatusToggle(member)}
                                     title={
                                       isSelf
@@ -1483,6 +2267,18 @@ function App() {
                                       </>
                                     )}
                                   </button>
+                                  {member.status === 'deactivated' && !isSelf && (
+                                    <button
+                                      className="secondary-button small-action-button danger-outline-button"
+                                      type="button"
+                                      disabled={isBusy}
+                                      onClick={() => openDeleteUserModal(member)}
+                                      aria-label={`Delete ${member.email} permanently`}
+                                      title="Permanently delete this deactivated user"
+                                    >
+                                      <Trash2 size={14} /> Delete permanently
+                                    </button>
+                                  )}
                                 </div>
                               </td>
                             </tr>
@@ -1512,6 +2308,7 @@ function App() {
                 </div>
                 <div className="hero-actions">
                   <button
+                    type="button"
                     className="secondary-button"
                     onClick={loadAudit}
                     disabled={auditLoading}
@@ -1529,6 +2326,9 @@ function App() {
               {auditError && (
                 <div className="notice error-notice" role="alert">
                   <span>{auditError}</span>
+                  <button type="button" onClick={loadAudit} className="retry-button">
+                    Retry <RefreshCw size={13} />
+                  </button>
                 </div>
               )}
 
@@ -1544,7 +2344,9 @@ function App() {
                         {auditEvents.length.toString().padStart(2, '0')}
                       </span>
                     </div>
-                    <p>Credentials, password hashes, and tokens are never stored in audit records.</p>
+                    <p>
+                      Credentials, password hashes, and tokens are never stored in audit records. Historical snapshots survive user deletion.
+                    </p>
                   </div>
                 </div>
                 <div className="table-wrap">
@@ -1610,45 +2412,100 @@ function App() {
                     <span className="kicker-mark" /> ACCOUNT & SECURITY
                   </p>
                   <h1>
-                    Session profile<span className="heading-period">.</span>
+                    Account & session<span className="heading-period">.</span>
                   </h1>
                   <p className="page-subtitle">
-                    Your active identity, effective role permissions, and session security posture.
+                    Authenticated identity, effective role permissions, and session security posture.
                   </p>
                 </div>
                 <div className="hero-actions">
-                  <button className="secondary-button" onClick={logout}>
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    onClick={loadProfile}
+                    disabled={profileLoading}
+                  >
+                    {profileLoading ? (
+                      <LoaderCircle className="spin" size={15} />
+                    ) : (
+                      <RefreshCw size={15} />
+                    )}{' '}
+                    Refresh profile
+                  </button>
+                  <button type="button" className="secondary-button danger-outline-button" onClick={logout}>
                     <LogOut size={15} /> Sign out & revoke session
                   </button>
                 </div>
               </section>
 
+              {profileError && (
+                <div className="notice error-notice" role="alert">
+                  <span>{profileError}</span>
+                  <button type="button" onClick={loadProfile} className="retry-button">
+                    Retry <RefreshCw size={13} />
+                  </button>
+                </div>
+              )}
+
               <section className="flags-panel settings-panel">
                 <div className="settings-grid">
                   <div>
-                    <span className="section-eyebrow">SIGNED-IN ACCOUNT</span>
-                    <h3>{currentUser?.name}</h3>
-                    <p><code>{currentUser?.email}</code></p>
-                    <p>
-                      Role:{' '}
-                      <span className={`role-badge ${currentRoleMeta.className}`}>
-                        {currentRoleMeta.label}
-                      </span>
-                    </p>
+                    <span className="section-eyebrow">AUTHENTICATED IDENTITY</span>
+                    <div className="settings-identity-row">
+                      <span className="profile-avatar large-avatar">{userInitials}</span>
+                      <div>
+                        <h3>{currentUser?.name || 'Workspace User'}</h3>
+                        <p>
+                          <code>{currentUser?.email || '—'}</code>
+                        </p>
+                      </div>
+                    </div>
+                    <div className="settings-meta-list">
+                      <div>
+                        <span>Assigned role</span>
+                        <span className={`role-badge ${currentRoleMeta.className}`}>
+                          {currentRoleMeta.label}
+                        </span>
+                      </div>
+                      <div>
+                        <span>Account status</span>
+                        <span className="status-pill status-active">
+                          <span />
+                          {currentUser?.status === 'deactivated' ? 'Deactivated' : 'Active'}
+                        </span>
+                      </div>
+                      <div>
+                        <span>Member since</span>
+                        <strong>{formatDate(currentUser?.createdAt)}</strong>
+                      </div>
+                    </div>
                     <p className="page-subtitle">{currentRoleMeta.summary}</p>
                   </div>
                   <div>
                     <span className="section-eyebrow">EFFECTIVE PERMISSIONS</span>
                     <div className="permission-list">
-                      {(currentUser?.permissions || []).map((perm) => (
-                        <code key={perm} className="permission-chip">
-                          {perm}
-                        </code>
-                      ))}
+                      {(currentUser?.permissions || []).length > 0 ? (
+                        currentUser.permissions.map((perm) => (
+                          <code key={perm} className="permission-chip">
+                            {perm}
+                          </code>
+                        ))
+                      ) : (
+                        <small>No permissions available</small>
+                      )}
                     </div>
-                    <p className="page-subtitle">
-                      Access tokens are held exclusively in memory (15-minute expiry) and are never persisted to localStorage. Refreshing the page requires signing in again.
-                    </p>
+                    <span className="section-eyebrow">SESSION SECURITY</span>
+                    <ul className="session-security-list">
+                      <li>
+                        <strong>15-minute access token expiry:</strong> Tokens are short-lived HS256 JWTs verified against your active database record on every request.
+                      </li>
+                      <li>
+                        <strong>In-memory storage only:</strong> Access tokens are never stored in <code>localStorage</code> or <code>sessionStorage</code>. Refreshing the browser tab clears the token and requires signing in again.
+                      </li>
+                      <li>
+                        <strong>Immediate revocation:</strong> Signing out increments your server-side <code>tokenVersion</code>, invalidating any active sessions immediately.
+                      </li>
+                    </ul>
                   </div>
                 </div>
               </section>
@@ -1977,6 +2834,89 @@ function App() {
                 </button>
               </div>
             </form>
+          </section>
+        </div>
+      )}
+
+      {deletingUser && canManageUsers && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !userDeleting) {
+              closeDeleteUserModal()
+            }
+          }}
+        >
+          <section
+            className="flag-modal confirm-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-user-modal-title"
+          >
+            <div className="modal-heading">
+              <div className="modal-kicker">
+                <span className="modal-icon danger-icon">
+                  <AlertTriangle size={17} />
+                </span>
+                <span>PERMANENT ACCOUNT REMOVAL</span>
+              </div>
+              <button
+                className="modal-close"
+                type="button"
+                disabled={userDeleting}
+                onClick={closeDeleteUserModal}
+                aria-label="Close dialog"
+              >
+                <X size={18} />
+              </button>
+              <h2 id="delete-user-modal-title">Delete deactivated user?</h2>
+              <p>
+                This permanently removes the user account from FeatureFlag Studio and cannot be undone.
+              </p>
+            </div>
+            <div className="confirm-modal-body">
+              <div className="confirm-target-summary">
+                <strong>{deletingUser.name}</strong>
+                <code>{deletingUser.email}</code>
+                <span className="status-pill status-deactivated">
+                  <span /> Deactivated {deletingUser.role}
+                </span>
+              </div>
+              <p className="confirm-note">
+                Historical audit log entries associated with this account will be preserved for compliance, and this deletion will be recorded in the audit trail.
+              </p>
+              {deleteUserError && (
+                <div className="form-error" role="alert">
+                  {deleteUserError}
+                </div>
+              )}
+              <div className="modal-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={closeDeleteUserModal}
+                  disabled={userDeleting}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="primary-button danger-button"
+                  onClick={confirmDeleteUser}
+                  disabled={userDeleting}
+                >
+                  {userDeleting ? (
+                    <>
+                      <LoaderCircle className="spin" size={16} /> Deleting...
+                    </>
+                  ) : (
+                    <>
+                      <Trash2 size={16} /> Delete permanently
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
           </section>
         </div>
       )}

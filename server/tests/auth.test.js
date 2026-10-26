@@ -645,3 +645,164 @@ test("user management enforces role assignment, deactivation, and last-admin pro
   assert.equal(serializedAudit.includes("ViewerPass123!"), false);
   assert.equal(serializedAudit.includes("$2"), false);
 });
+
+test("permanent user deletion enforces deactivated-only, admin-only, self/last-admin guards, and preserves historical audit trail", async () => {
+  const admin = await createTestUser({
+    name: "Primary Admin",
+    email: "admin@example.com",
+    role: "admin",
+  });
+  const dev = await createTestUser({
+    name: "Developer User",
+    email: "dev@example.com",
+    role: "developer",
+  });
+  const viewer = await createTestUser({
+    name: "Viewer User",
+    email: "viewer@example.com",
+    role: "viewer",
+  });
+
+  // Have the developer perform a flag creation so they appear as an actor in AuditLog
+  const flagRes = await api("/api/flags", {
+    method: "POST",
+    token: dev.token,
+    body: {
+      name: "Dev Created Flag",
+      key: "dev_created_flag",
+      environments: {
+        development: { enabled: true, rolloutPercentage: 50, allowlist: [], denylist: [] },
+        staging: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+        production: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+      },
+    },
+  });
+  assert.equal(flagRes.status, 201);
+
+  // 1. Unauthenticated and non-admin callers cannot delete users
+  assert.equal(
+    (await api(`/api/users/${viewer.user._id}`, { method: "DELETE" })).status,
+    401
+  );
+  assert.equal(
+    (
+      await api(`/api/users/${viewer.user._id}`, {
+        method: "DELETE",
+        token: dev.token,
+      })
+    ).status,
+    403
+  );
+  assert.equal(
+    (
+      await api(`/api/users/${dev.user._id}`, {
+        method: "DELETE",
+        token: viewer.token,
+      })
+    ).status,
+    403
+  );
+
+  // 2. Invalid IDs and nonexistent users return 400 and 404 safely
+  assert.equal(
+    (
+      await api("/api/users/not-a-valid-object-id", {
+        method: "DELETE",
+        token: admin.token,
+      })
+    ).status,
+    400
+  );
+  assert.equal(
+    (
+      await api("/api/users/000000000000000000000000", {
+        method: "DELETE",
+        token: admin.token,
+      })
+    ).status,
+    404
+  );
+
+  // 3. Cannot delete the last active administrator (409) or self when another admin exists (400)
+  assert.equal(
+    (
+      await api(`/api/users/${admin.user._id}`, {
+        method: "DELETE",
+        token: admin.token,
+      })
+    ).status,
+    409
+  );
+  const secondAdmin = await createTestUser({
+    name: "Backup Admin",
+    email: "admin2@example.com",
+    role: "admin",
+  });
+  assert.equal(
+    (
+      await api(`/api/users/${admin.user._id}`, {
+        method: "DELETE",
+        token: admin.token,
+      })
+    ).status,
+    400
+  );
+  await User.deleteOne({ _id: secondAdmin.user._id });
+
+  // 4. Cannot delete an active user before deactivating them
+  const activeDelete = await api(`/api/users/${dev.user._id}`, {
+    method: "DELETE",
+    token: admin.token,
+  });
+  assert.equal(activeDelete.status, 409);
+  assert.match(activeDelete.body.message, /Deactivate the user first/i);
+
+  // 5. Deactivate the developer account, then permanently delete it
+  const deactivateDev = await api(`/api/users/${dev.user._id}/status`, {
+    method: "PATCH",
+    token: admin.token,
+    body: { status: "deactivated" },
+  });
+  assert.equal(deactivateDev.status, 200);
+
+  const deleteDev = await api(`/api/users/${dev.user._id}`, {
+    method: "DELETE",
+    token: admin.token,
+  });
+  assert.equal(deleteDev.status, 200);
+  assert.equal(deleteDev.body.data.email, "dev@example.com");
+  assert.equal(await User.findById(dev.user._id), null);
+
+  // 6. Repeated deletion request returns 404 safely without crashing
+  const repeatDelete = await api(`/api/users/${dev.user._id}`, {
+    method: "DELETE",
+    token: admin.token,
+  });
+  assert.equal(repeatDelete.status, 404);
+
+  // 7. Historical audit records survive user deletion, and user.deleted is recorded
+  const auditRes = await api("/api/audit", { token: admin.token });
+  assert.equal(auditRes.status, 200);
+  const events = auditRes.body.data;
+
+  const historicalFlagEvent = events.find(
+    (entry) =>
+      entry.action === "flag.created" && entry.actorEmail === "dev@example.com"
+  );
+  assert.ok(historicalFlagEvent, "historical flag.created event by deleted user must survive");
+  assert.equal(historicalFlagEvent.targetLabel, "dev_created_flag");
+
+  const historicalDeactivateEvent = events.find(
+    (entry) =>
+      entry.action === "user.deactivated" && entry.targetLabel === "dev@example.com"
+  );
+  assert.ok(historicalDeactivateEvent, "historical user.deactivated event must survive");
+
+  const deletionEvent = events.find(
+    (entry) =>
+      entry.action === "user.deleted" && entry.targetLabel === "dev@example.com"
+  );
+  assert.ok(deletionEvent, "user.deleted audit event must be recorded");
+  assert.equal(deletionEvent.actorEmail, "admin@example.com");
+  assert.equal(String(deletionEvent.actor), String(admin.user._id));
+});

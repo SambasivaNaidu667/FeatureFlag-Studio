@@ -131,4 +131,50 @@ async function updateStatus(req, res, next) {
   }
 }
 
-module.exports = { listUsers, createUser, updateRole, updateStatus };
+async function deleteUser(req, res, next) {
+  try {
+    const user = await findTarget(req, res);
+    if (!user) return;
+    if (await isLastActiveAdmin(user)) {
+      return res.status(409).json({
+        success: false,
+        message: "Cannot delete the last active administrator",
+      });
+    }
+    if (user._id.equals(req.user._id)) {
+      return badRequest(res, "You cannot delete your own account");
+    }
+    if (user.status !== "deactivated") {
+      return res.status(409).json({
+        success: false,
+        message: "Active accounts cannot be permanently deleted. Deactivate the user first.",
+      });
+    }
+
+    const deleted = await User.findOneAndDelete({
+      _id: user._id,
+      status: "deactivated",
+    });
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    await recordAudit(req.user, {
+      action: "user.deleted",
+      targetType: "user",
+      targetId: deleted._id,
+      targetLabel: deleted.email,
+      summary: `Permanently deleted deactivated ${deleted.role} account (${deleted.name})`,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "User permanently deleted",
+      data: { id: String(deleted._id), email: deleted.email },
+    });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+module.exports = { listUsers, createUser, updateRole, updateStatus, deleteUser };
