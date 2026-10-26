@@ -1,128 +1,142 @@
 const assert = require("node:assert/strict");
-const test = require("node:test");
+const { after, before, beforeEach, test } = require("node:test");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
+const { MongoMemoryServer } = require("mongodb-memory-server");
+
 const { app } = require("../src/server");
+const User = require("../src/models/User");
+const FeatureFlag = require("../src/models/FeatureFlag");
+const AuditLog = require("../src/models/AuditLog");
 const {
-  authenticate,
   requireAuth,
+  signAccessToken,
   validateAuthConfig,
   verifyAccessToken,
 } = require("../src/auth/auth");
+const {
+  bootstrapAdmin,
+  parseBootstrapArgs,
+  validateBootstrapConfig,
+} = require("../src/scripts/bootstrapAdmin");
 
-const config = {
-  username: "test-admin",
-  passwordHash: bcrypt.hashSync("correct-password", 4),
-  jwtSecret: "a-test-secret-that-is-at-least-32-characters-long",
-  expiresIn: "15m",
-};
+const TEST_JWT_SECRET = "a-test-secret-that-is-at-least-32-characters-long";
 
-test("login succeeds with valid credentials", async () => {
-  const token = await authenticate("test-admin", "correct-password", config);
-  assert.equal(typeof token, "string");
-  assert.equal(verifyAccessToken(token, config).role, "admin");
-});
+let mongoServer;
+let httpServer;
+let baseUrl;
+let previousEnv;
 
-test("login endpoint issues a token for valid credentials", async () => {
-  const previous = {
-    username: process.env.ADMIN_USERNAME,
-    passwordHash: process.env.ADMIN_PASSWORD_HASH,
-    jwtSecret: process.env.JWT_SECRET,
+before(async () => {
+  previousEnv = {
+    JWT_SECRET: process.env.JWT_SECRET,
+    BCRYPT_ROUNDS: process.env.BCRYPT_ROUNDS,
+    ALLOW_PUBLIC_REGISTRATION: process.env.ALLOW_PUBLIC_REGISTRATION,
+    LOGIN_RATE_LIMIT_MAX: process.env.LOGIN_RATE_LIMIT_MAX,
+    REGISTER_RATE_LIMIT_MAX: process.env.REGISTER_RATE_LIMIT_MAX,
   };
-  process.env.ADMIN_USERNAME = config.username;
-  process.env.ADMIN_PASSWORD_HASH = config.passwordHash;
-  process.env.JWT_SECRET = config.jwtSecret;
-  const server = app.listen(0);
-  try {
-    const { port } = server.address();
-    const response = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        username: config.username,
-        password: "correct-password",
-      }),
-    });
-    const result = await response.json();
-    assert.equal(response.status, 200);
-    assert.equal(typeof result.data.accessToken, "string");
-  } finally {
-    server.close();
-    for (const [key, value] of Object.entries({
-      ADMIN_USERNAME: previous.username,
-      ADMIN_PASSWORD_HASH: previous.passwordHash,
-      JWT_SECRET: previous.jwtSecret,
-    })) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
+  process.env.JWT_SECRET = TEST_JWT_SECRET;
+  process.env.BCRYPT_ROUNDS = "4";
+  process.env.ALLOW_PUBLIC_REGISTRATION = "true";
+
+  mongoServer = await MongoMemoryServer.create();
+  await mongoose.connect(mongoServer.getUri());
+
+  httpServer = app.listen(0);
+  const { port } = httpServer.address();
+  baseUrl = `http://127.0.0.1:${port}`;
+});
+
+beforeEach(async () => {
+  process.env.JWT_SECRET = TEST_JWT_SECRET;
+  process.env.ALLOW_PUBLIC_REGISTRATION = "true";
+  await Promise.all([
+    User.deleteMany({}),
+    FeatureFlag.deleteMany({}),
+    AuditLog.deleteMany({}),
+  ]);
+});
+
+after(async () => {
+  if (httpServer) httpServer.close();
+  await mongoose.disconnect();
+  if (mongoServer) await mongoServer.stop();
+  for (const [key, value] of Object.entries(previousEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
   }
 });
 
-test("login rejects an incorrect password without revealing which field failed", async () => {
-  assert.equal(await authenticate("test-admin", "wrong-password", config), null);
-});
+async function createTestUser({
+  name = "Test User",
+  email,
+  password = "Password123!",
+  role = "viewer",
+  status = "active",
+}) {
+  const passwordHash = await bcrypt.hash(password, 4);
+  const user = await User.create({
+    name,
+    email,
+    passwordHash,
+    role,
+    status,
+  });
+  const token = signAccessToken(user, {
+    jwtSecret: TEST_JWT_SECRET,
+    expiresIn: "15m",
+  });
+  return { user, token, password };
+}
 
-test("login endpoint rejects missing or malformed credentials", async () => {
-  const server = app.listen(0);
-  try {
-    const { port } = server.address();
-    const response = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username: "admin" }),
-    });
-    assert.equal(response.status, 400);
-  } finally {
-    server.close();
-  }
-});
+async function api(path, { method = "GET", token, body } = {}) {
+  const headers = { "content-type": "application/json" };
+  if (token) headers.authorization = `Bearer ${token}`;
+  const response = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const json = await response.json().catch(() => ({}));
+  return { status: response.status, body: json, headers: response.headers };
+}
 
 test("authentication configuration must be complete and use a strong JWT secret", () => {
   assert.throws(
-    () => validateAuthConfig({ username: "admin", passwordHash: "hash" }),
+    () => validateAuthConfig({ jwtSecret: "" }),
     /Missing authentication configuration/
   );
   assert.throws(
-    () =>
-      validateAuthConfig({
-        ...config,
-        jwtSecret: "too-short",
-      }),
+    () => validateAuthConfig({ jwtSecret: "too-short" }),
     /at least 32 characters/
   );
 });
 
-test("expired and invalid-signature tokens are rejected", () => {
+test("expired, invalid-signature, and wrong-algorithm tokens are rejected", async () => {
+  const { user } = await createTestUser({
+    email: "token-check@example.com",
+    role: "admin",
+  });
+  const config = { jwtSecret: TEST_JWT_SECRET, expiresIn: "15m" };
+
   const expired = jwt.sign(
-    { sub: config.username, role: "admin" },
-    config.jwtSecret,
+    { sub: String(user._id), ver: 0 },
+    TEST_JWT_SECRET,
     { expiresIn: -1, issuer: "featureflag-studio" }
   );
   assert.throws(() => verifyAccessToken(expired, config));
-  assert.throws(() =>
-    verifyAccessToken(`${expired}invalid`, config)
-  );
-});
+  assert.throws(() => verifyAccessToken(`${expired}tampered`, config));
 
-test("tokens using another signing algorithm are rejected", () => {
   const wrongAlgorithm = jwt.sign(
-    { sub: config.username, role: "admin" },
-    config.jwtSecret,
+    { sub: String(user._id), ver: 0 },
+    TEST_JWT_SECRET,
     { algorithm: "HS512", issuer: "featureflag-studio" }
   );
   assert.throws(() => verifyAccessToken(wrongAlgorithm, config));
 });
 
-test("bearer headers with extra fields are rejected", () => {
-  const previous = {
-    username: process.env.ADMIN_USERNAME,
-    passwordHash: process.env.ADMIN_PASSWORD_HASH,
-    jwtSecret: process.env.JWT_SECRET,
-  };
-  process.env.ADMIN_USERNAME = config.username;
-  process.env.ADMIN_PASSWORD_HASH = config.passwordHash;
-  process.env.JWT_SECRET = config.jwtSecret;
+test("bearer headers with extra fields and unauthenticated requests are rejected", async () => {
   const response = {
     statusCode: 200,
     body: null,
@@ -139,74 +153,495 @@ test("bearer headers with extra fields are rejected", () => {
       return name === "authorization" ? "Bearer token extra" : undefined;
     },
   };
-  requireAuth(request, response, () => {
+  await requireAuth(request, response, () => {
     throw new Error("malformed bearer header was accepted");
   });
   assert.equal(response.statusCode, 401);
-  for (const [key, value] of Object.entries({
-    ADMIN_USERNAME: previous.username,
-    ADMIN_PASSWORD_HASH: previous.passwordHash,
-    JWT_SECRET: previous.jwtSecret,
-  })) {
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
-  }
-});
 
-test("management routes reject requests without a bearer token", async () => {
-  const previous = {
-    username: process.env.ADMIN_USERNAME,
-    passwordHash: process.env.ADMIN_PASSWORD_HASH,
-    jwtSecret: process.env.JWT_SECRET,
-  };
-  process.env.ADMIN_USERNAME = config.username;
-  process.env.ADMIN_PASSWORD_HASH = config.passwordHash;
-  process.env.JWT_SECRET = config.jwtSecret;
-  const server = app.listen(0);
-  try {
-    const { port } = server.address();
-    const response = await fetch(`http://127.0.0.1:${port}/api/flags`);
-    assert.equal(response.status, 401);
-  } finally {
-    server.close();
-    for (const [key, value] of Object.entries({
-      ADMIN_USERNAME: previous.username,
-      ADMIN_PASSWORD_HASH: previous.passwordHash,
-      JWT_SECRET: previous.jwtSecret,
-    })) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
+  const flagsRes = await api("/api/flags");
+  assert.equal(flagsRes.status, 401);
+  const usersRes = await api("/api/users");
+  assert.equal(usersRes.status, 401);
+  const auditRes = await api("/api/audit");
+  assert.equal(auditRes.status, 401);
 });
 
 test("login fails safely when authentication configuration is missing", async () => {
-  const previous = {
-    username: process.env.ADMIN_USERNAME,
-    passwordHash: process.env.ADMIN_PASSWORD_HASH,
-    jwtSecret: process.env.JWT_SECRET,
-  };
-  delete process.env.ADMIN_USERNAME;
-  delete process.env.ADMIN_PASSWORD_HASH;
   delete process.env.JWT_SECRET;
-  const server = app.listen(0);
-  try {
-    const { port } = server.address();
-    const response = await fetch(`http://127.0.0.1:${port}/api/auth/login`, {
+  const res = await api("/api/auth/login", {
+    method: "POST",
+    body: { email: "admin@example.com", password: "Password123!" },
+  });
+  assert.equal(res.status, 503);
+});
+
+test("bootstrap validates ADMIN_EMAIL explicitly, defaults to dry-run, is idempotent, and supports confirmed password reset", async () => {
+  const validHash = bcrypt.hashSync("InitialAdminPass123!", 4);
+
+  // CLI argument rules
+  assert.deepEqual(parseBootstrapArgs([]), {
+    apply: false,
+    dryRun: true,
+    resetPassword: false,
+    confirmReset: false,
+  });
+  assert.throws(() => parseBootstrapArgs(["--dry-run", "--apply"]), /Cannot combine/);
+  assert.throws(
+    () => parseBootstrapArgs(["--apply", "--reset-password"]),
+    /requires explicit confirmation/
+  );
+
+  // Never silently interpret ADMIN_USERNAME as ADMIN_EMAIL
+  assert.throws(
+    () =>
+      validateBootstrapConfig({
+        ADMIN_USERNAME: "admin",
+        ADMIN_PASSWORD_HASH: validHash,
+      }),
+    /ADMIN_EMAIL is required/
+  );
+
+  // Create an existing flag first to verify bootstrap never deletes flags
+  await FeatureFlag.create({
+    name: "Existing Flag",
+    key: "existing_flag",
+    description: "Must remain intact",
+    environments: {
+      development: { enabled: true, rolloutPercentage: 100, allowlist: [], denylist: [] },
+      staging: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+      production: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+    },
+  });
+
+  const env = {
+    ADMIN_EMAIL: "Admin@FeatureFlag.local",
+    ADMIN_NAME: "Initial Admin",
+    ADMIN_PASSWORD_HASH: validHash,
+  };
+  const silentLogger = { log() {} };
+
+  // 1. Dry-run does not write
+  const dryResult = await bootstrapAdmin({ env, apply: false, logger: silentLogger });
+  assert.equal(dryResult.action, "would_create");
+  assert.equal(await User.countDocuments(), 0);
+
+  // 2. Apply creates the administrator reusing the existing bcrypt hash
+  const createdResult = await bootstrapAdmin({ env, apply: true, logger: silentLogger });
+  assert.equal(createdResult.action, "created");
+  assert.equal(await User.countDocuments(), 1);
+
+  // 3. Re-running apply is idempotent and does not duplicate the admin
+  const secondRun = await bootstrapAdmin({ env, apply: true, logger: silentLogger });
+  assert.equal(secondRun.action, "already_exists");
+  assert.equal(await User.countDocuments(), 1);
+  assert.equal(await FeatureFlag.countDocuments(), 1);
+
+  // Verify the bootstrapped administrator can log in with ADMIN_EMAIL and the original password
+  const loginRes = await api("/api/auth/login", {
+    method: "POST",
+    body: { email: "admin@featureflag.local", password: "InitialAdminPass123!" },
+  });
+  assert.equal(loginRes.status, 200);
+  assert.equal(loginRes.body.data.user.role, "admin");
+  const oldToken = loginRes.body.data.accessToken;
+
+  // 4. Confirmed password reset updates the hash and revokes prior tokens
+  const newHash = bcrypt.hashSync("RecoveredAdminPass456!", 4);
+  const resetResult = await bootstrapAdmin({
+    env: { ...env, ADMIN_PASSWORD_HASH: newHash },
+    apply: true,
+    resetPassword: true,
+    confirmReset: true,
+    logger: silentLogger,
+  });
+  assert.equal(resetResult.action, "password_reset");
+
+  const oldTokenCheck = await api("/api/auth/me", { token: oldToken });
+  assert.equal(oldTokenCheck.status, 401);
+
+  const newLogin = await api("/api/auth/login", {
+    method: "POST",
+    body: { email: "admin@featureflag.local", password: "RecoveredAdminPass456!" },
+  });
+  assert.equal(newLogin.status, 200);
+});
+
+test("public registration assigns viewer role, prevents privilege escalation, and handles duplicate emails safely", async () => {
+  const regRes = await api("/api/auth/register", {
+    method: "POST",
+    body: {
+      name: "New Member",
+      email: "NewMember@Example.com",
+      password: "StrongPassword123",
+      role: "admin",
+    },
+  });
+  assert.equal(regRes.status, 202);
+
+  const stored = await User.findOne({ email: "newmember@example.com" }).select("+passwordHash");
+  assert.ok(stored);
+  assert.equal(stored.role, "viewer");
+  assert.notEqual(stored.passwordHash, "StrongPassword123");
+  assert.equal(await bcrypt.compare("StrongPassword123", stored.passwordHash), true);
+
+  // Duplicate email returns identical 202 response without creating a second record
+  const dupRes = await api("/api/auth/register", {
+    method: "POST",
+    body: {
+      name: "Duplicate",
+      email: "newmember@example.com",
+      password: "AnotherPassword123",
+    },
+  });
+  assert.equal(dupRes.status, 202);
+  assert.equal(dupRes.body.message, regRes.body.message);
+  assert.equal(await User.countDocuments({ email: "newmember@example.com" }), 1);
+
+  // Disabled public registration returns 403
+  process.env.ALLOW_PUBLIC_REGISTRATION = "false";
+  const disabledRes = await api("/api/auth/register", {
+    method: "POST",
+    body: {
+      name: "Blocked",
+      email: "blocked@example.com",
+      password: "StrongPassword123",
+    },
+  });
+  assert.equal(disabledRes.status, 403);
+});
+
+test("login, /api/auth/me, and /api/auth/logout enforce session lifecycle", async () => {
+  await createTestUser({
+    name: "Alice Admin",
+    email: "alice@example.com",
+    password: "CorrectHorseBattery",
+    role: "admin",
+  });
+
+  const badPass = await api("/api/auth/login", {
+    method: "POST",
+    body: { email: "alice@example.com", password: "WrongPassword" },
+  });
+  assert.equal(badPass.status, 401);
+
+  const missingField = await api("/api/auth/login", {
+    method: "POST",
+    body: { email: "alice@example.com" },
+  });
+  assert.equal(missingField.status, 400);
+
+  const loginRes = await api("/api/auth/login", {
+    method: "POST",
+    body: { email: "ALICE@example.com", password: "CorrectHorseBattery" },
+  });
+  assert.equal(loginRes.status, 200);
+  const token = loginRes.body.data.accessToken;
+  assert.equal(loginRes.body.data.user.role, "admin");
+
+  const meRes = await api("/api/auth/me", { token });
+  assert.equal(meRes.status, 200);
+  assert.equal(meRes.body.data.email, "alice@example.com");
+
+  const logoutRes = await api("/api/auth/logout", { method: "POST", token });
+  assert.equal(logoutRes.status, 200);
+
+  const afterLogout = await api("/api/auth/me", { token });
+  assert.equal(afterLogout.status, 401);
+});
+
+test("RBAC enforces admin, developer, and viewer permissions and protects production mutations", async () => {
+  const admin = await createTestUser({ email: "admin@example.com", role: "admin" });
+  const dev = await createTestUser({ email: "dev@example.com", role: "developer" });
+  const viewer = await createTestUser({ email: "viewer@example.com", role: "viewer" });
+
+  const defaultEnvs = {
+    development: { enabled: false, rolloutPercentage: 25, allowlist: ["u1"], denylist: [] },
+    staging: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+    production: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+  };
+
+  // Viewer cannot create flags
+  const viewerCreate = await api("/api/flags", {
+    method: "POST",
+    token: viewer.token,
+    body: { name: "Viewer Flag", key: "viewer_flag", environments: defaultEnvs },
+  });
+  assert.equal(viewerCreate.status, 403);
+
+  // Developer cannot create a flag that enables or configures production
+  for (const prodOverride of [
+    { enabled: true, rolloutPercentage: 0, allowlist: [], denylist: [] },
+    { enabled: false, rolloutPercentage: 50, allowlist: [], denylist: [] },
+    { enabled: false, rolloutPercentage: 0, allowlist: ["vip"], denylist: [] },
+    { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: ["blocked"] },
+  ]) {
+    const devProdCreate = await api("/api/flags", {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ username: "admin", password: "password" }),
+      token: dev.token,
+      body: {
+        name: "Unsafe Prod Flag",
+        key: "unsafe_prod_flag",
+        environments: { ...defaultEnvs, production: prodOverride },
+      },
     });
-    assert.equal(response.status, 503);
-  } finally {
-    server.close();
-    for (const [key, value] of Object.entries({
-      ADMIN_USERNAME: previous.username,
-      ADMIN_PASSWORD_HASH: previous.passwordHash,
-      JWT_SECRET: previous.jwtSecret,
-    })) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
+    assert.equal(devProdCreate.status, 403);
   }
+  assert.equal(await FeatureFlag.countDocuments({ key: "unsafe_prod_flag" }), 0);
+
+  // Developer can create a flag with safe default production config
+  const devCreate = await api("/api/flags", {
+    method: "POST",
+    token: dev.token,
+    body: { name: "Checkout Flow", key: "checkout_flow", environments: defaultEnvs },
+  });
+  assert.equal(devCreate.status, 201);
+  const flagId = devCreate.body.data._id;
+
+  // Viewer can read flags but cannot update, toggle, or delete
+  assert.equal((await api("/api/flags", { token: viewer.token })).status, 200);
+  assert.equal((await api(`/api/flags/${flagId}`, { token: viewer.token })).status, 200);
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}`, {
+        method: "PATCH",
+        token: viewer.token,
+        body: { name: "Renamed" },
+      })
+    ).status,
+    403
+  );
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}/environments/development/toggle`, {
+        method: "PATCH",
+        token: viewer.token,
+      })
+    ).status,
+    403
+  );
+  assert.equal(
+    (await api(`/api/flags/${flagId}`, { method: "DELETE", token: viewer.token })).status,
+    403
+  );
+
+  // Developer can update metadata and toggle/configure development & staging
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}`, {
+        method: "PATCH",
+        token: dev.token,
+        body: { description: "Updated by developer" },
+      })
+    ).status,
+    200
+  );
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}/environments/development`, {
+        method: "PATCH",
+        token: dev.token,
+        body: { rolloutPercentage: 80, allowlist: ["dev-user"], denylist: ["deny-user"] },
+      })
+    ).status,
+    200
+  );
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}/environments/development/toggle`, {
+        method: "PATCH",
+        token: dev.token,
+      })
+    ).status,
+    200
+  );
+
+  // Developer cannot modify or toggle production through any endpoint
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}/environments/production`, {
+        method: "PATCH",
+        token: dev.token,
+        body: { rolloutPercentage: 10 },
+      })
+    ).status,
+    403
+  );
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}/environments/production/toggle`, {
+        method: "PATCH",
+        token: dev.token,
+      })
+    ).status,
+    403
+  );
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}/toggle`, {
+        method: "PATCH",
+        token: dev.token,
+        body: { environment: "production" },
+      })
+    ).status,
+    403
+  );
+
+  // Developer cannot delete flags
+  assert.equal(
+    (await api(`/api/flags/${flagId}`, { method: "DELETE", token: dev.token })).status,
+    403
+  );
+
+  // Public evaluation endpoint remains unauthenticated and returns only boolean value
+  const evalAllow = await api(
+    "/api/flags/evaluate/checkout_flow/development?userId=dev-user"
+  );
+  assert.equal(evalAllow.status, 200);
+  assert.deepEqual(evalAllow.body, { success: true, data: { value: true } });
+
+  const evalDeny = await api(
+    "/api/flags/evaluate/checkout_flow/development?userId=deny-user"
+  );
+  assert.deepEqual(evalDeny.body, { success: true, data: { value: false } });
+
+  // Admin can modify production and delete flags
+  assert.equal(
+    (
+      await api(`/api/flags/${flagId}/environments/production/toggle`, {
+        method: "PATCH",
+        token: admin.token,
+      })
+    ).status,
+    200
+  );
+  assert.equal(
+    (await api(`/api/flags/${flagId}`, { method: "DELETE", token: admin.token })).status,
+    200
+  );
+});
+
+test("user management enforces role assignment, deactivation, and last-admin protection, and records audit logs", async () => {
+  const admin = await createTestUser({
+    name: "Primary Admin",
+    email: "admin@example.com",
+    role: "admin",
+  });
+  const dev = await createTestUser({
+    name: "Dev User",
+    email: "dev@example.com",
+    role: "developer",
+  });
+
+  // Non-admins cannot manage users or read audit logs
+  assert.equal((await api("/api/users", { token: dev.token })).status, 403);
+  assert.equal((await api("/api/audit", { token: dev.token })).status, 403);
+
+  // Admin creates a user
+  const createRes = await api("/api/users", {
+    method: "POST",
+    token: admin.token,
+    body: {
+      name: "Viewer User",
+      email: "viewer@example.com",
+      password: "ViewerPass123!",
+      role: "viewer",
+    },
+  });
+  assert.equal(createRes.status, 201);
+  assert.equal(createRes.body.data.passwordHash, undefined);
+
+  // Reject invalid role assignment
+  const invalidRole = await api(`/api/users/${dev.user._id}/role`, {
+    method: "PATCH",
+    token: admin.token,
+    body: { role: "superadmin" },
+  });
+  assert.equal(invalidRole.status, 400);
+
+  // Prevent demoting or deactivating the last active administrator
+  const lastAdminDemote = await api(`/api/users/${admin.user._id}/role`, {
+    method: "PATCH",
+    token: admin.token,
+    body: { role: "viewer" },
+  });
+  assert.equal(lastAdminDemote.status, 409);
+
+  const lastAdminDeactivate = await api(`/api/users/${admin.user._id}/status`, {
+    method: "PATCH",
+    token: admin.token,
+    body: { status: "deactivated" },
+  });
+  assert.equal(lastAdminDeactivate.status, 409);
+
+  // Even when a second admin exists, self-demotion and self-deactivation are blocked
+  const secondAdmin = await createTestUser({
+    name: "Second Admin",
+    email: "admin2@example.com",
+    role: "admin",
+  });
+  const selfDemote = await api(`/api/users/${admin.user._id}/role`, {
+    method: "PATCH",
+    token: admin.token,
+    body: { role: "viewer" },
+  });
+  assert.equal(selfDemote.status, 400);
+
+  const selfDeactivate = await api(`/api/users/${admin.user._id}/status`, {
+    method: "PATCH",
+    token: admin.token,
+    body: { status: "deactivated" },
+  });
+  assert.equal(selfDeactivate.status, 400);
+  await User.deleteOne({ _id: secondAdmin.user._id });
+
+  // Role change takes effect immediately on the next request without re-issuing the token
+  const demoteDev = await api(`/api/users/${dev.user._id}/role`, {
+    method: "PATCH",
+    token: admin.token,
+    body: { role: "viewer" },
+  });
+  assert.equal(demoteDev.status, 200);
+
+  const devCreateAfterDemote = await api("/api/flags", {
+    method: "POST",
+    token: dev.token,
+    body: {
+      name: "Blocked Flag",
+      key: "blocked_flag",
+      environments: {
+        development: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+        staging: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+        production: { enabled: false, rolloutPercentage: 0, allowlist: [], denylist: [] },
+      },
+    },
+  });
+  assert.equal(devCreateAfterDemote.status, 403);
+
+  // Deactivating a user revokes their active token and blocks future login
+  const deactivateRes = await api(`/api/users/${dev.user._id}/status`, {
+    method: "PATCH",
+    token: admin.token,
+    body: { status: "deactivated" },
+  });
+  assert.equal(deactivateRes.status, 200);
+
+  const deactivatedTokenUse = await api("/api/flags", { token: dev.token });
+  assert.equal(deactivatedTokenUse.status, 401);
+
+  const deactivatedLogin = await api("/api/auth/login", {
+    method: "POST",
+    body: { email: "dev@example.com", password: dev.password },
+  });
+  assert.equal(deactivatedLogin.status, 403);
+
+  // Audit log contains the administrative events and no sensitive values
+  const auditRes = await api("/api/audit", { token: admin.token });
+  assert.equal(auditRes.status, 200);
+  const actions = auditRes.body.data.map((entry) => entry.action);
+  assert.ok(actions.includes("user.created"));
+  assert.ok(actions.includes("user.role_changed"));
+  assert.ok(actions.includes("user.deactivated"));
+  const serializedAudit = JSON.stringify(auditRes.body.data);
+  assert.equal(serializedAudit.includes("ViewerPass123!"), false);
+  assert.equal(serializedAudit.includes("$2"), false);
 });
