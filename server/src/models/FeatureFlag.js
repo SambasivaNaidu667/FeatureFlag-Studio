@@ -91,9 +91,19 @@ const featureFlagSchema = new mongoose.Schema(
   }
 );
 
-featureFlagSchema.path("environments").validate((value) => {
-  return value && ENVIRONMENTS.every((environment) => value[environment]);
-}, "All supported environments are required");
+featureFlagSchema.pre("validate", function () {
+  const environments = this.environments;
+
+  if (
+    !environments ||
+    !ENVIRONMENTS.every((environment) => environments[environment])
+  ) {
+    this.invalidate(
+      "environments",
+      "All supported environments are required"
+    );
+  }
+});
 
 featureFlagSchema.statics.ENVIRONMENTS = ENVIRONMENTS;
 featureFlagSchema.statics.MAX_TARGETING_IDS = MAX_TARGETING_IDS;
