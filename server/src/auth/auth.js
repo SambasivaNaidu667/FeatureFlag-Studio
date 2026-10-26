@@ -9,10 +9,28 @@ const PASSWORD_MIN_LENGTH = 8;
 // bcrypt ignores input beyond 72 bytes; reject longer passwords explicitly.
 const PASSWORD_MAX_BYTES = 72;
 
+function cleanEnvString(value) {
+  if (typeof value !== "string") return value;
+  let cleaned = value.trim();
+  if (
+    cleaned.length >= 2 &&
+    ((cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+      (cleaned.startsWith("'") && cleaned.endsWith("'")))
+  ) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  return cleaned;
+}
+
 function getAuthConfig(env = process.env) {
+  let jwtSecret = cleanEnvString(env.JWT_SECRET);
+  if (typeof jwtSecret === "string" && /^JWT_SECRET\s*=/i.test(jwtSecret)) {
+    jwtSecret = cleanEnvString(jwtSecret.replace(/^JWT_SECRET\s*=/i, ""));
+  }
+  const expiresIn = cleanEnvString(env.JWT_EXPIRES_IN) || "15m";
   return {
-    jwtSecret: env.JWT_SECRET,
-    expiresIn: env.JWT_EXPIRES_IN || "15m",
+    jwtSecret,
+    expiresIn,
   };
 }
 

@@ -3,8 +3,12 @@ const connectDB = require("../src/config/db");
 const { validateAuthConfig, getAuthConfig } = require("../src/auth/auth");
 
 function resolveServerlessTrustProxy(env = process.env) {
-  const explicit = env.TRUST_PROXY;
+  const explicit = connectDB.cleanEnvValue(env.TRUST_PROXY);
   if (explicit !== undefined && String(explicit).trim() !== "") {
+    const normalized = String(explicit).trim().toLowerCase();
+    if (env.VERCEL === "1" && normalized === "true") {
+      return 1;
+    }
     return explicit;
   }
   return env.VERCEL === "1" ? 1 : false;
@@ -13,13 +17,27 @@ function resolveServerlessTrustProxy(env = process.env) {
 async function handler(req, res) {
   try {
     configureTrustProxy(app, resolveServerlessTrustProxy(process.env));
+    if (req.method === "OPTIONS") {
+      return app(req, res);
+    }
     validateAuthConfig(getAuthConfig());
     await connectDB();
   } catch (error) {
-    console.error("Serverless initialization error:", error.message);
-    return res.status(500).json({
+    const diagnostic = connectDB.classifyInitializationError(error);
+    console.error(
+      `[serverless:init] stage=${diagnostic.stage} code=${diagnostic.code} errorName=${error?.name || "Error"} message=${diagnostic.message}`
+    );
+    req.initError = error;
+    req.initDiagnostic = diagnostic;
+    const urlPath = (req.url || "").split("?")[0];
+    if (urlPath === "/api/health" || urlPath === "/") {
+      return app(req, res);
+    }
+    return res.status(diagnostic.status || 503).json({
       success: false,
-      message: "Server configuration or database connection failed",
+      code: diagnostic.code,
+      stage: diagnostic.stage,
+      message: diagnostic.message,
     });
   }
 

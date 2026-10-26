@@ -1064,7 +1064,45 @@ test("Vercel serverless handler serves /api/health, login, authenticated routes,
 
     // Warm invocations reused the active Mongoose connection without reconnecting
     assert.equal(connectCalls, 0);
+
+    // 4. Quoted JWT_SECRET and MONGODB_URI values are sanitized safely
+    const connectDB = require("../src/config/db");
+    const { getAuthConfig } = require("../src/auth/auth");
+    assert.equal(
+      connectDB.normalizeMongoUri('  "mongodb+srv://cluster.example.net/db"  '),
+      "mongodb+srv://cluster.example.net/db"
+    );
+    assert.equal(
+      connectDB.normalizeMongoUri(
+        'MONGODB_URI="mongodb+srv://cluster.example.net/db"'
+      ),
+      "mongodb+srv://cluster.example.net/db"
+    );
+    assert.equal(
+      getAuthConfig({
+        JWT_SECRET: `JWT_SECRET="${TEST_JWT_SECRET}"`,
+        JWT_EXPIRES_IN: '"15m"',
+      }).jwtSecret,
+      TEST_JWT_SECRET
+    );
+
+    // 5. When auth config or DB connection is unhealthy, /api/health returns 503 with safe diagnostics and CORS headers
+    delete process.env.JWT_SECRET;
+    const unhealthyHealthRes = await fetch(`${serverlessUrl}/api/health`, {
+      headers: { Origin: "https://featureflag-studio.vercel.app" },
+    });
+    assert.equal(unhealthyHealthRes.status, 503);
+    assert.equal(
+      unhealthyHealthRes.headers.get("access-control-allow-origin"),
+      "https://featureflag-studio.vercel.app"
+    );
+    const unhealthyBody = await unhealthyHealthRes.json();
+    assert.equal(unhealthyBody.success, false);
+    assert.equal(unhealthyBody.code, "MISSING_JWT_SECRET");
+    assert.equal(unhealthyBody.stage, "auth_config");
+    process.env.JWT_SECRET = TEST_JWT_SECRET;
   } finally {
+    process.env.JWT_SECRET = TEST_JWT_SECRET;
     mongoose.connect = originalConnect;
     if (prevOrigin === undefined) delete process.env.CLIENT_ORIGIN;
     else process.env.CLIENT_ORIGIN = prevOrigin;

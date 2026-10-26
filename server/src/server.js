@@ -5,7 +5,7 @@ const dotenv = require("dotenv");
 const path = require("node:path");
 
 // Load environment variables before importing routes and middleware.
-dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
+dotenv.config({ path: path.resolve(__dirname, "..", ".env"), quiet: true });
 
 const featureFlagRoutes = require("./routes/featureFlagRoutes");
 const authRoutes = require("./routes/authRoutes");
@@ -73,7 +73,13 @@ try {
 function getAllowedOrigins(value = process.env.CLIENT_ORIGIN) {
   return (value || "http://localhost:5173,http://127.0.0.1:5173")
     .split(",")
-    .map((origin) => origin.trim().replace(/\/+$/, ""))
+    .map((origin) =>
+      origin
+        .trim()
+        .replace(/^(['"])(.*)\1$/, "$2")
+        .trim()
+        .replace(/\/+$/, "")
+    )
     .filter(Boolean);
 }
 
@@ -99,19 +105,67 @@ app.use("/api/users", userRouter);
 app.use("/api/audit", auditRouter);
 app.use("/api/flags", featureFlagRoutes);
 
-app.get("/api/health", (req, res) => {
+function buildHealthReport(req) {
   const mongoose = require("mongoose");
+  const environment = process.env.NODE_ENV || "development";
+  const timestamp = new Date().toISOString();
+  const isConnected = mongoose.connection.readyState === 1;
 
-  res.status(200).json({
-    success: true,
-    message: "FeatureFlag Studio API is running",
-    environment: process.env.NODE_ENV || "development",
-    database:
-      mongoose.connection.readyState === 1
-        ? "connected"
-        : "disconnected",
-    timestamp: new Date().toISOString(),
-  });
+  let diagnostic = req?.initDiagnostic || null;
+  if (!diagnostic) {
+    try {
+      validateAuthConfig(getAuthConfig());
+    } catch (error) {
+      diagnostic = connectDB.classifyInitializationError(error);
+    }
+  }
+  if (!diagnostic && !isConnected) {
+    const lastError = connectDB.getLastError();
+    diagnostic = lastError
+      ? connectDB.classifyInitializationError(lastError)
+      : {
+          status: 503,
+          code: "DATABASE_DISCONNECTED",
+          stage: "database_connection",
+          message: "Database is disconnected",
+        };
+  }
+
+  if (diagnostic || !isConnected) {
+    return {
+      statusCode: diagnostic?.status || 503,
+      body: {
+        success: false,
+        code: diagnostic.code,
+        stage: diagnostic.stage,
+        message: diagnostic.message,
+        environment,
+        database: isConnected ? "connected" : "disconnected",
+        timestamp,
+      },
+    };
+  }
+
+  return {
+    statusCode: 200,
+    body: {
+      success: true,
+      message: "FeatureFlag Studio API is running",
+      environment,
+      database: "connected",
+      timestamp,
+    },
+  };
+}
+
+app.get("/", (req, res) => {
+  const report = buildHealthReport(req);
+  return res.status(report.statusCode).json(report.body);
+});
+
+app.get("/api/health", (req, res) => {
+  const report = buildHealthReport(req);
+  return res.status(report.statusCode).json(report.body);
 });
 
 app.use(notFoundHandler);

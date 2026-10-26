@@ -231,4 +231,14 @@ test("resolveServerlessTrustProxy defaults to false locally, 1 on Vercel, and ho
     ),
     false
   );
+  assert.equal(
+    resolveServerlessTrustProxy({ VERCEL: "1", TRUST_PROXY: "true" }),
+    1
+  );
+  assert.equal(
+    resolveTrustProxy(
+      resolveServerlessTrustProxy({ VERCEL: "1", TRUST_PROXY: '"1"' })
+    ),
+    1
+  );
 });
