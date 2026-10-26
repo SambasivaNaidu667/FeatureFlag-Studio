@@ -2,9 +2,10 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
+const path = require("node:path");
 
 // Load environment variables before importing routes and middleware.
-dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
 
 const featureFlagRoutes = require("./routes/featureFlagRoutes");
 const authRoutes = require("./routes/authRoutes");
@@ -19,7 +20,10 @@ const {
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const allowedOrigins = (process.env.CLIENT_ORIGIN || "http://localhost:5173")
+const allowedOrigins = (
+  process.env.CLIENT_ORIGIN ||
+  "http://localhost:5173,http://127.0.0.1:5173"
+)
   .split(",")
   .map((origin) => origin.trim())
   .filter(Boolean);
@@ -58,10 +62,20 @@ async function startServer() {
     validateAuthConfig(getAuthConfig());
     await connectDB();
 
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(
         `FeatureFlag Studio API running at http://localhost:${PORT}`
       );
+    });
+    server.on("error", (error) => {
+      if (error.code === "EADDRINUSE") {
+        console.error(
+          `Port ${PORT} is already in use. Another backend instance is probably running; stop it or set PORT in server/.env.`
+        );
+      } else {
+        console.error("Server error:", error.message);
+      }
+      process.exit(1);
     });
   } catch (error) {
     console.error("Failed to start the server:", error.message);
