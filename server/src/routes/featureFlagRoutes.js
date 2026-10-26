@@ -1,6 +1,7 @@
 
 const express = require("express");
-const { requireAuth } = require("../auth/auth");
+const { requireAuth, requirePermission } = require("../auth/auth");
+const { can } = require("../auth/permissions");
 const { rateLimitFromEnv } = require("../middleware/rateLimiter");
 
 const {
@@ -24,6 +25,19 @@ const evaluationRateLimiter = rateLimitFromEnv({
   message: "Too many evaluation requests, please try again later",
 });
 
+// Production changes are restricted to roles holding "flags:production".
+function requireEnvironmentAccess(req, res, next) {
+  const environmentName =
+    req.params.environmentName || req.body?.environment || "development";
+  if (environmentName === "production" && !can(req.user.role, "flags:production")) {
+    return res.status(403).json({
+      success: false,
+      message: "Only administrators can change production configuration",
+    });
+  }
+  return next();
+}
+
 // Evaluation is intentionally public and returns only the boolean decision.
 router.get(
   "/evaluate/:key/:environmentName",
@@ -31,15 +45,31 @@ router.get(
   evaluate
 );
 
-// All flag-management and configuration routes require an admin token.
+// All flag-management routes require an authenticated, active user.
+// Permissions are checked per route against the role stored in the database.
 router.use(requireAuth);
-router.post("/", createFlag);
-router.get("/", getAllFlags);
-router.get("/:id", getFlagById);
-router.patch("/:id", updateFlag);
-router.patch("/:id/toggle", toggleFlag);
-router.patch("/:id/environments/:environmentName", updateEnvironment);
-router.patch("/:id/environments/:environmentName/toggle", toggleEnvironment);
-router.delete("/:id", deleteFlag);
+router.get("/", requirePermission("flags:read"), getAllFlags);
+router.get("/:id", requirePermission("flags:read"), getFlagById);
+router.post("/", requirePermission("flags:create"), createFlag);
+router.patch("/:id", requirePermission("flags:update"), updateFlag);
+router.patch(
+  "/:id/toggle",
+  requirePermission("flags:toggle"),
+  requireEnvironmentAccess,
+  toggleFlag
+);
+router.patch(
+  "/:id/environments/:environmentName",
+  requirePermission("flags:update"),
+  requireEnvironmentAccess,
+  updateEnvironment
+);
+router.patch(
+  "/:id/environments/:environmentName/toggle",
+  requirePermission("flags:toggle"),
+  requireEnvironmentAccess,
+  toggleEnvironment
+);
+router.delete("/:id", requirePermission("flags:delete"), deleteFlag);
 
 module.exports = router;

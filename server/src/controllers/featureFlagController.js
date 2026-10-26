@@ -1,6 +1,8 @@
 const mongoose = require("mongoose");
 const FeatureFlag = require("../models/FeatureFlag");
 const { ENVIRONMENTS, evaluateFlag } = require("../services/evaluationEngine");
+const { can } = require("../auth/permissions");
+const { recordAudit } = require("../services/auditService");
 
 const metadataFields = ["name", "key", "description"];
 const environmentFields = [
@@ -69,6 +71,54 @@ function validateEnvironmentPayload(body) {
   return null;
 }
 
+// True when a create payload configures production beyond the safe defaults.
+function configuresProduction(environments) {
+  const production = environments?.production;
+  if (!production || typeof production !== "object") return false;
+  const allowedKeys = new Set([
+    "enabled",
+    "rolloutPercentage",
+    "allowlist",
+    "denylist",
+  ]);
+  if (Object.keys(production).some((key) => !allowedKeys.has(key))) {
+    return true;
+  }
+  if (production.enabled !== undefined && production.enabled !== false) {
+    return true;
+  }
+  if (
+    production.rolloutPercentage !== undefined &&
+    production.rolloutPercentage !== 0
+  ) {
+    return true;
+  }
+  if (
+    production.allowlist !== undefined &&
+    (!Array.isArray(production.allowlist) || production.allowlist.length > 0)
+  ) {
+    return true;
+  }
+  if (
+    production.denylist !== undefined &&
+    (!Array.isArray(production.denylist) || production.denylist.length > 0)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function describeTargeting(body) {
+  return environmentFields
+    .filter((field) => Object.hasOwn(body, field))
+    .map((field) =>
+      Array.isArray(body[field])
+        ? `${field}: ${body[field].length} ID(s)`
+        : `${field}: ${body[field]}`
+    )
+    .join(", ");
+}
+
 async function createFlag(req, res, next) {
   try {
     const body = req.body || {};
@@ -81,11 +131,24 @@ async function createFlag(req, res, next) {
         message: `Unexpected field: ${unexpected[0]}`,
       });
     }
+    if (configuresProduction(body.environments) && !can(req.user.role, "flags:production")) {
+      return res.status(403).json({
+        success: false,
+        message: "Only administrators can change production configuration",
+      });
+    }
     const flag = await FeatureFlag.create({
       name: body.name,
       key: body.key,
       description: body.description,
       environments: body.environments,
+    });
+    await recordAudit(req.user, {
+      action: "flag.created",
+      targetType: "flag",
+      targetId: flag._id,
+      targetLabel: flag.key,
+      summary: `Created "${flag.name}"`,
     });
     return res.status(201).json({
       success: true,
@@ -141,6 +204,13 @@ async function updateFlag(req, res, next) {
     if (!flag) {
       return res.status(404).json({ success: false, message: "Feature flag not found" });
     }
+    await recordAudit(req.user, {
+      action: "flag.updated",
+      targetType: "flag",
+      targetId: flag._id,
+      targetLabel: flag.key,
+      summary: `Updated ${Object.keys(updates).join(", ")}`,
+    });
     return res.status(200).json({
       success: true,
       message: "Feature flag updated successfully",
@@ -155,6 +225,15 @@ async function updateEnvironment(req, res, next) {
   try {
     if (invalidId(res, req.params.id)) return;
     if (!validateEnvironment(req.params.environmentName, res)) return;
+    if (
+      req.params.environmentName === "production" &&
+      !can(req.user?.role, "flags:production")
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Only administrators can change production configuration",
+      });
+    }
     const validationMessage = validateEnvironmentPayload(req.body);
     if (validationMessage) {
       return res.status(400).json({ success: false, message: validationMessage });
@@ -174,6 +253,13 @@ async function updateEnvironment(req, res, next) {
     if (!flag) {
       return res.status(404).json({ success: false, message: "Feature flag not found" });
     }
+    await recordAudit(req.user, {
+      action: "flag.targeting_updated",
+      targetType: "flag",
+      targetId: flag._id,
+      targetLabel: flag.key,
+      summary: `${req.params.environmentName}: ${describeTargeting(req.body)}`,
+    });
     return res.status(200).json({
       success: true,
       message: "Environment configuration updated successfully",
@@ -189,6 +275,15 @@ async function toggleEnvironment(req, res, next) {
   try {
     if (invalidId(res, req.params.id)) return;
     if (!validateEnvironment(req.params.environmentName, res)) return;
+    if (
+      req.params.environmentName === "production" &&
+      !can(req.user?.role, "flags:production")
+    ) {
+      return res.status(403).json({
+        success: false,
+        message: "Only administrators can change production configuration",
+      });
+    }
     const flag = await FeatureFlag.findById(req.params.id);
     if (!flag) {
       return res.status(404).json({ success: false, message: "Feature flag not found" });
@@ -199,6 +294,14 @@ async function toggleEnvironment(req, res, next) {
       { $set: { [path]: !flag.environments[req.params.environmentName].enabled } },
       { new: true, runValidators: true }
     );
+    const enabled = updated.environments[req.params.environmentName].enabled;
+    await recordAudit(req.user, {
+      action: enabled ? "flag.enabled" : "flag.disabled",
+      targetType: "flag",
+      targetId: updated._id,
+      targetLabel: updated.key,
+      summary: `${enabled ? "Enabled" : "Disabled"} in ${req.params.environmentName}`,
+    });
     return res.status(200).json({
       success: true,
       message: "Environment status updated successfully",
@@ -240,6 +343,13 @@ async function deleteFlag(req, res, next) {
     if (invalidId(res, req.params.id)) return;
     const flag = await FeatureFlag.findByIdAndDelete(req.params.id);
     if (!flag) return res.status(404).json({ success: false, message: "Feature flag not found" });
+    await recordAudit(req.user, {
+      action: "flag.deleted",
+      targetType: "flag",
+      targetId: flag._id,
+      targetLabel: flag.key,
+      summary: `Deleted "${flag.name}"`,
+    });
     return res.status(200).json({ success: true, message: "Feature flag deleted successfully" });
   } catch (error) {
     return next(error);
