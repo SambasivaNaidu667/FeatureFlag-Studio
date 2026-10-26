@@ -209,10 +209,19 @@ test("proxy-aware rate limiting ignores X-Forwarded-For by default and uses it o
   });
 });
 
-test("resolveServerlessTrustProxy defaults to false locally, 1 on Vercel, and honors explicit TRUST_PROXY", () => {
+test("resolveServerlessTrustProxy defaults to false locally, 1 on Vercel/Render, and honors explicit TRUST_PROXY", () => {
   const { resolveServerlessTrustProxy } = serverlessHandler;
   assert.equal(resolveServerlessTrustProxy({}), false);
   assert.equal(resolveServerlessTrustProxy({ VERCEL: "1" }), 1);
+  assert.equal(resolveServerlessTrustProxy({ RENDER: "true" }), 1);
+  assert.equal(
+    resolveServerlessTrustProxy({ RENDER: "true", TRUST_PROXY: "true" }),
+    1
+  );
+  assert.equal(
+    resolveServerlessTrustProxy({ RENDER: "true", TRUST_PROXY: "false" }),
+    "false"
+  );
   assert.equal(
     resolveServerlessTrustProxy({ VERCEL: "1", TRUST_PROXY: "false" }),
     "false"

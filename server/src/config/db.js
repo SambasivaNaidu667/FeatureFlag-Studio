@@ -113,7 +113,7 @@ function classifyInitializationError(error) {
       code: "MONGODB_ATLAS_NETWORK_ACCESS",
       stage: "database_network",
       message:
-        "Database connection failed: could not reach MongoDB Atlas. Ensure Atlas Network Access allows Vercel IPs (0.0.0.0/0) and MONGODB_URI points to an active cluster.",
+        "Database connection failed: could not reach MongoDB Atlas. Ensure Atlas Network Access allows your deployment IPs (0.0.0.0/0) and MONGODB_URI points to an active cluster.",
     };
   }
 
@@ -161,8 +161,12 @@ async function connectDB(rawUri = process.env.MONGODB_URI) {
     serverSelectionTimeoutMS,
   };
 
-  // Only apply custom DNS override outside Vercel serverless when a valid IP is provided.
-  if (process.env.MONGODB_DNS_SERVER && process.env.VERCEL !== "1") {
+  // Only apply custom DNS override in local development (outside cloud runtimes) when a valid IP is provided.
+  if (
+    process.env.MONGODB_DNS_SERVER &&
+    process.env.VERCEL !== "1" &&
+    process.env.RENDER !== "true"
+  ) {
     const dnsServer = cleanEnvValue(process.env.MONGODB_DNS_SERVER);
     if (net.isIP(dnsServer) !== 0) {
       const dns = require("node:dns");

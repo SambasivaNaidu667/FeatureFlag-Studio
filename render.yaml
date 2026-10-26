@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: feature-flag-studio-api
+    runtime: node
+    rootDir: server
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "1"
+      - key: CLIENT_ORIGIN
+        value: https://feature-flag-studio-kappa.vercel.app
+      - key: JWT_EXPIRES_IN
+        value: 15m
+      - key: ALLOW_PUBLIC_REGISTRATION
+        value: "false"
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false

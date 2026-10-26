@@ -20,7 +20,8 @@ const {
 } = require("./middleware/errorHandler");
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = Number(process.env.PORT) || 5000;
+const HOST = process.env.HOST || "0.0.0.0";
 
 const NAMED_TRUST_PROXY_SUBNETS = new Set([
   "loopback",
@@ -184,43 +185,65 @@ app.get("/api/health", (req, res) => {
 app.use(notFoundHandler);
 app.use(errorHandler);
 
+function resolveServerlessTrustProxy(env = process.env) {
+  const isCloudProxyRuntime = env.VERCEL === "1" || env.RENDER === "true";
+  const explicit = connectDB.cleanEnvValue(env.TRUST_PROXY);
+  if (explicit !== undefined && String(explicit).trim() !== "") {
+    const normalized = String(explicit).trim().toLowerCase();
+    if (isCloudProxyRuntime && normalized === "true") {
+      return 1;
+    }
+    return explicit;
+  }
+  return isCloudProxyRuntime ? 1 : false;
+}
+
 async function startServer() {
   try {
-    configureTrustProxy(app, process.env.TRUST_PROXY);
+    const port = Number(process.env.PORT) || PORT;
+    const host = process.env.HOST || HOST;
+    configureTrustProxy(app, resolveServerlessTrustProxy(process.env));
     validateAuthConfig(getAuthConfig());
     await connectDB();
 
-    const server = app.listen(PORT, () => {
+    const server = app.listen(port, host, () => {
       console.log(
-        `FeatureFlag Studio API running at http://localhost:${PORT}`
+        `FeatureFlag Studio API running at http://${host}:${port}`
       );
     });
     server.on("error", (error) => {
       if (error.code === "EADDRINUSE") {
         console.error(
-          `Port ${PORT} is already in use. Another backend instance is probably running; stop it or set PORT in server/.env.`
+          `Port ${port} is already in use. Another backend instance is probably running; stop it or set PORT in server/.env.`
         );
       } else {
         console.error("Server error:", error.message);
       }
       process.exit(1);
     });
+
+    const shutdown = (signal) => {
+      console.log(`Received ${signal}, shutting down gracefully...`);
+      server.close(async () => {
+        try {
+          const mongoose = require("mongoose");
+          if (mongoose.connection.readyState !== 0) {
+            await mongoose.connection.close();
+          }
+        } catch {
+          // Ignore close errors during shutdown
+        }
+        process.exit(0);
+      });
+    };
+    process.once("SIGTERM", () => shutdown("SIGTERM"));
+    process.once("SIGINT", () => shutdown("SIGINT"));
+
+    return server;
   } catch (error) {
     console.error("Failed to start the server:", error.message);
     process.exit(1);
   }
-}
-
-function resolveServerlessTrustProxy(env = process.env) {
-  const explicit = connectDB.cleanEnvValue(env.TRUST_PROXY);
-  if (explicit !== undefined && String(explicit).trim() !== "") {
-    const normalized = String(explicit).trim().toLowerCase();
-    if (env.VERCEL === "1" && normalized === "true") {
-      return 1;
-    }
-    return explicit;
-  }
-  return env.VERCEL === "1" ? 1 : false;
 }
 
 async function serverlessHandler(req, res) {
