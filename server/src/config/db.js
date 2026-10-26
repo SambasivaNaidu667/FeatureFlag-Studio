@@ -173,6 +173,7 @@ async function connectDB(rawUri = process.env.MONGODB_URI) {
   connectionPromise = Promise.resolve()
     .then(() => mongoose.connect(uri, options))
     .then((conn) => {
+      connectionPromise = null;
       lastConnectionError = null;
       console.log("MongoDB Atlas connected successfully");
       return conn?.connection || mongoose.connection;

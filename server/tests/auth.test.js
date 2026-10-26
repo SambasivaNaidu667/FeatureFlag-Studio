@@ -1065,7 +1065,27 @@ test("Vercel serverless handler serves /api/health, login, authenticated routes,
     // Warm invocations reused the active Mongoose connection without reconnecting
     assert.equal(connectCalls, 0);
 
-    // 4. Quoted JWT_SECRET and MONGODB_URI values are sanitized safely
+    // 4. Root route (/ and /?utm_source=...) and src/server.js default export work as a Vercel Express handler
+    const serverEntrypoint = require("../src/server");
+    assert.equal(typeof serverEntrypoint, "function");
+    assert.equal(serverEntrypoint, serverlessHandler);
+
+    const rootQueryRes = await fetch(
+      `${serverlessUrl}/?utm_source=chatgpt.com`,
+      {
+        headers: { Origin: "https://feature-flag-studio-kappa.vercel.app" },
+      }
+    );
+    assert.equal(rootQueryRes.status, 200);
+    assert.equal(
+      rootQueryRes.headers.get("access-control-allow-origin"),
+      "https://feature-flag-studio-kappa.vercel.app"
+    );
+    const rootQueryBody = await rootQueryRes.json();
+    assert.equal(rootQueryBody.success, true);
+    assert.equal(rootQueryBody.database, "connected");
+
+    // 5. Quoted JWT_SECRET and MONGODB_URI values are sanitized safely
     const connectDB = require("../src/config/db");
     const { getAuthConfig } = require("../src/auth/auth");
     assert.equal(

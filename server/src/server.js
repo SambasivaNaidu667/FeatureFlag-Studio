@@ -70,17 +70,30 @@ try {
   app.set("trust proxy", false);
 }
 
+const DEFAULT_CLIENT_ORIGINS = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://feature-flag-studio-kappa.vercel.app",
+];
+
 function getAllowedOrigins(value = process.env.CLIENT_ORIGIN) {
-  return (value || "http://localhost:5173,http://127.0.0.1:5173")
-    .split(",")
-    .map((origin) =>
-      origin
-        .trim()
-        .replace(/^(['"])(.*)\1$/, "$2")
-        .trim()
-        .replace(/\/+$/, "")
+  const rawList = value
+    ? `${value},${DEFAULT_CLIENT_ORIGINS.join(",")}`
+    : DEFAULT_CLIENT_ORIGINS.join(",");
+  return Array.from(
+    new Set(
+      rawList
+        .split(",")
+        .map((origin) =>
+          origin
+            .trim()
+            .replace(/^(['"])(.*)\1$/, "$2")
+            .trim()
+            .replace(/\/+$/, "")
+        )
+        .filter(Boolean)
     )
-    .filter(Boolean);
+  );
 }
 
 app.use(securityHeaders);
@@ -198,14 +211,57 @@ async function startServer() {
   }
 }
 
+function resolveServerlessTrustProxy(env = process.env) {
+  const explicit = connectDB.cleanEnvValue(env.TRUST_PROXY);
+  if (explicit !== undefined && String(explicit).trim() !== "") {
+    const normalized = String(explicit).trim().toLowerCase();
+    if (env.VERCEL === "1" && normalized === "true") {
+      return 1;
+    }
+    return explicit;
+  }
+  return env.VERCEL === "1" ? 1 : false;
+}
+
+async function serverlessHandler(req, res) {
+  try {
+    configureTrustProxy(app, resolveServerlessTrustProxy(process.env));
+    if (req.method === "OPTIONS") {
+      return app(req, res);
+    }
+    validateAuthConfig(getAuthConfig());
+    await connectDB();
+  } catch (error) {
+    const diagnostic = connectDB.classifyInitializationError(error);
+    console.error(
+      `[serverless:init] stage=${diagnostic.stage} code=${diagnostic.code} errorName=${error?.name || "Error"} message=${diagnostic.message}`
+    );
+    req.initError = error;
+    req.initDiagnostic = diagnostic;
+    const urlPath = (req.url || "").split("?")[0];
+    if (urlPath === "/api/health" || urlPath === "/") {
+      return app(req, res);
+    }
+    return res.status(diagnostic.status || 503).json({
+      success: false,
+      code: diagnostic.code,
+      stage: diagnostic.stage,
+      message: diagnostic.message,
+    });
+  }
+
+  return app(req, res);
+}
+
 if (require.main === module) {
   startServer();
 }
 
-module.exports = {
-  app,
-  startServer,
-  resolveTrustProxy,
-  configureTrustProxy,
-  getAllowedOrigins,
-};
+serverlessHandler.app = app;
+serverlessHandler.startServer = startServer;
+serverlessHandler.resolveTrustProxy = resolveTrustProxy;
+serverlessHandler.configureTrustProxy = configureTrustProxy;
+serverlessHandler.getAllowedOrigins = getAllowedOrigins;
+serverlessHandler.resolveServerlessTrustProxy = resolveServerlessTrustProxy;
+
+module.exports = serverlessHandler;
